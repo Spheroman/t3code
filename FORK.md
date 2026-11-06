@@ -13,11 +13,14 @@ does every turn before the agent starts. Deleting the thread runs
 ## Branches
 
 - `main` mirrors upstream.
-- `newgit` (default) is upstream plus the patch stack, one commit per
-  concern:
+- `newgit` (default) is upstream plus the fork's changes:
   1. newgit workspaces in place of worktrees (server only)
   2. a desktop identity that installs beside upstream T3 Code
   3. fixes to that identity
+
+  It is also the `t3code` tracker in [newgit](https://github.com/Spheroman/newgit),
+  mounted at `apps/t3code`, so it only moves forward: upstream comes in by
+  merging, never by rebasing, and nothing is force-pushed.
 
 ## Install (macOS)
 
@@ -64,7 +67,7 @@ upstream T3 Code, so both run at once:
   T3 Code, not this app.
 - Eleven upstream desktop and build-script tests assert upstream's app ID,
   state directory, and CLI name, so they fail here. They are left as they
-  are to keep rebases clean.
+  are to keep upstream merges clean.
 
 ## Keeping up with upstream
 
@@ -73,12 +76,26 @@ The newgit logic lives in `apps/server/src/vcs/newgitWorkspaces.ts`,
 `apps/desktop/src/forkIdentity.ts`. Every edit to an upstream file is marked
 `newgit fork patch`, so `git grep "newgit fork patch"` lists every hook.
 
+Bring upstream into the fork with a merge, here, on GitHub:
+
 ```sh
 git remote add upstream https://github.com/pingdotgg/t3code  # once
 git fetch upstream
 git switch main && git merge --ff-only upstream/main && git push origin main
-git switch newgit && git rebase main
+git switch newgit && git merge main
 git grep -n "newgit fork patch"   # check each hook still sits where it should
-git push --force-with-lease origin newgit
+git push origin newgit
 scripts/fork/install-mac.sh
 ```
+
+Then bring it into newgit, in newgit's project root:
+
+```sh
+newgit pull --remote t3code   # t3code's `main` takes what Spheroman/t3code has
+newgit pull t3code            # newgit's root pins it: one merge under apps/t3code
+newgit merge main             # publish both to newgit.dev
+```
+
+A change made in newgit under `apps/t3code` goes the other way: `git push`
+from the workspace exports its branch to Spheroman/t3code, where `gh pr
+create` opens the pull request.
