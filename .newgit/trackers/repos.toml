@@ -4,3 +4,4 @@ merge_with_source = true
 mount = ".repos"
 paths = ["."]
 git = true
+priority = -1
