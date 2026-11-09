@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - probes for the newgit binary synchronously to decide whether to skip.
 import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
@@ -25,12 +26,21 @@ const newgitAvailable =
 
 const layerTest = GitVcsDriver.layer.pipe(
   Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-newgit-test-" })),
-  Layer.provideMerge(NodeServices.layer),
+  Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
 );
 
 const run = (cwd: string, command: string, args: ReadonlyArray<string>) => {
   const result = NodeChildProcess.spawnSync(command, args, { cwd, encoding: "utf8" });
   if (result.status !== 0) throw new Error(`${command} ${args.join(" ")}: ${result.stderr}`);
+};
+
+// Set T3CODE_NEWGIT_BIN (unset for undefined), returning its previous value. The source reads it
+// the same way, outside Effect.
+const swapNewgitBin = (value: string | undefined) => {
+  const previous = process.env.T3CODE_NEWGIT_BIN;
+  if (value === undefined) delete process.env.T3CODE_NEWGIT_BIN;
+  else process.env.T3CODE_NEWGIT_BIN = value;
+  return previous;
 };
 
 // Point T3CODE_NEWGIT_BIN at a script standing in for newgit for the scope's lifetime.
@@ -42,16 +52,8 @@ const fakeNewgit = (script: string) =>
     yield* fileSystem.writeFileString(bin, `#!/bin/sh\n${script}\n`);
     yield* fileSystem.chmod(bin, 0o755);
     yield* Effect.acquireRelease(
-      Effect.sync(() => {
-        const previous = process.env.T3CODE_NEWGIT_BIN;
-        process.env.T3CODE_NEWGIT_BIN = bin;
-        return previous;
-      }),
-      (previous) =>
-        Effect.sync(() => {
-          if (previous === undefined) delete process.env.T3CODE_NEWGIT_BIN;
-          else process.env.T3CODE_NEWGIT_BIN = previous;
-        }),
+      Effect.sync(() => swapNewgitBin(bin)),
+      (previous) => Effect.sync(() => swapNewgitBin(previous)),
     );
   });
 
@@ -206,22 +208,17 @@ describe("newgit workspaces", () => {
 
   it.effect("falls back to a git worktree when newgit cannot run", () =>
     Effect.gen(function* () {
-      const previous = process.env.T3CODE_NEWGIT_BIN;
-      process.env.T3CODE_NEWGIT_BIN = "/nonexistent/newgit";
+      yield* Effect.acquireRelease(
+        Effect.sync(() => swapNewgitBin("/nonexistent/newgit")),
+        (previous) => Effect.sync(() => swapNewgitBin(previous)),
+      );
       const workspace = yield* spawnNewgitWorkspace({
         cwd: process.cwd(),
         name: "feature",
         from: "main",
-      }).pipe(
-        Effect.ensuring(
-          Effect.sync(() => {
-            if (previous === undefined) delete process.env.T3CODE_NEWGIT_BIN;
-            else process.env.T3CODE_NEWGIT_BIN = previous;
-          }),
-        ),
-      );
+      });
       assert.deepEqual(workspace, Option.none());
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.effect("reads the instance marker and ignores plain directories", () =>
