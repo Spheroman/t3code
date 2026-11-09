@@ -18,6 +18,7 @@ import ProjectScriptsControl, {
 } from "../ProjectScriptsControl";
 import { memo, useState, type ComponentProps } from "react";
 import { ThreadDetailsCard } from "./ThreadDetailsCard";
+import { NewgitTrackersPanel } from "./NewgitTrackersPanel";
 import { OpenInPicker } from "./OpenInPicker";
 import { ThreadDetailsSection } from "./ThreadDetailsSection";
 import { ThreadAutomationsPanel } from "./ThreadAutomationsPanel";
@@ -222,6 +223,14 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                   <div className="flex flex-col">
                     {show.branch ? (
                       <BranchToolbar layout="panel" panelSection="branch" {...branchToolbarProps} />
+                    ) : null}
+                    {/* newgit fork patch: a new worktree's trackers, in a newgit project. */}
+                    {show.branch && props.draftId && props.envMode === "worktree" ? (
+                      <NewgitTrackersPanel
+                        environmentId={props.environmentId}
+                        cwd={props.gitCwd}
+                        threadId={props.threadId}
+                      />
                     ) : null}
                     {show.git ? (
                       <GitActionsControl

@@ -27,6 +27,7 @@ import {
 } from "./scheduledTask.ts";
 import { ProviderInteractionMode, ProviderRequestKind, RuntimeMode } from "./providerPolicy.ts";
 import { PullRequestState } from "./pullRequest.ts";
+import { NewgitTrackerChoice } from "./git.ts";
 import {
   ThreadLinkedPullRequest,
   ThreadPullRequestKey,
@@ -177,6 +178,8 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
         "'shared' (default): parent checkout. 'worktree': new prepared checkout from the parent commit, for a separate checkout or PR per child. Uncommitted edits stay out.",
     }),
   ),
+  // newgit fork patch: the child's trackers, with `isolation: 'worktree'` in a newgit project.
+  newgitTrackers: Schema.optional(NewgitTrackerChoice),
   mode: Schema.optional(
     Schema.Literals(["async", "wait"]).annotate({
       description:

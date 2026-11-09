@@ -252,6 +252,9 @@ const make = Effect.gen(function* () {
               newRefName: input.branch,
               baseRefName,
               path: null,
+              ...(input.newgitTrackers === undefined
+                ? {}
+                : { newgitTrackers: input.newgitTrackers }),
             })
             .pipe(asOperationFailed("Unable to create the worktree")),
         );

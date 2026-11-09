@@ -12,6 +12,7 @@ import {
   type OrchestrationV2DelegatedFrom,
   type OrchestrationV2LinkOrigin,
   type OrchestrationV2ProviderThreadNativeMetadata,
+  type NewgitTrackerChoice,
   type OrchestrationV2ThreadProjection,
   type ProviderDriverKind,
   type ProviderInteractionMode,
@@ -66,6 +67,8 @@ export type ThreadLaunchWorkspaceStrategy =
       readonly baseRef: string;
       readonly branch?: string | undefined;
       readonly startFromOrigin?: boolean | undefined;
+      // newgit fork patch: trackers the new newgit workspace binds beyond its defaults.
+      readonly newgitTrackers?: NewgitTrackerChoice | undefined;
     };
 
 export interface ThreadLaunchInitialMessage {
@@ -443,6 +446,9 @@ const make = Effect.gen(function* () {
               newRefName: branch!,
               baseRefName,
               path: null,
+              ...(input.workspaceStrategy.newgitTrackers === undefined
+                ? {}
+                : { newgitTrackers: input.workspaceStrategy.newgitTrackers }),
             },
             {
               progress: {

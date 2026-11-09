@@ -526,17 +526,26 @@ export const titleFromMessage = (message: string) => {
 const launchWorkspaceStrategy = (input: {
   readonly worktree: Option.Option<string>;
   readonly branch: Option.Option<string>;
+  readonly use: ReadonlyArray<string>;
+  readonly drop: ReadonlyArray<string>;
 }) =>
   Option.match(input.worktree, {
     onNone: () =>
       Option.isSome(input.branch)
         ? Effect.fail(new ThreadUsageError({ detail: "--branch needs --worktree <base-ref>." }))
-        : Effect.void,
+        : input.use.length + input.drop.length > 0
+          ? Effect.fail(
+              new ThreadUsageError({ detail: "--use and --drop need --worktree <base-ref>." }),
+            )
+          : Effect.void,
     onSome: (baseRef) =>
       Effect.succeed({
         type: "worktree" as const,
         baseRef,
         ...Option.match(input.branch, { onNone: () => ({}), onSome: (branch) => ({ branch }) }),
+        ...(input.use.length + input.drop.length > 0
+          ? { newgitTrackers: { use: [...input.use], drop: [...input.drop] } }
+          : {}),
       }),
   });
 
@@ -625,6 +634,17 @@ const threadStartCommand = Command.make("start", {
   branch: Flag.String("branch").pipe(
     Flag.withDescription("Branch name for the new worktree."),
     Flag.optional,
+  ),
+  // newgit fork patch: the new worktree's trackers, as `newgit spawn --use`/`--drop`.
+  use: Flag.String("use").pipe(
+    Flag.withDescription("newgit projects: bind this tracker in the new worktree (repeatable)."),
+    Flag.atLeast(0),
+  ),
+  drop: Flag.String("drop").pipe(
+    Flag.withDescription(
+      "newgit projects: leave this tracker out of the new worktree (repeatable).",
+    ),
+    Flag.atLeast(0),
   ),
   wait: waitFlag,
   json: jsonFlag,

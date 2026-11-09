@@ -4242,6 +4242,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             cwd: input.cwd,
             name: targetBranch,
             from: input.refName,
+            trackers: input.newgitTrackers,
           });
         }),
       );
@@ -4251,6 +4252,19 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         }
         return { worktree: { path: newgitPath.value, refName: targetBranch } };
       }
+    }
+    // newgit fork patch: a tracker choice a plain worktree cannot honor is an error, not ignored.
+    if (
+      input.newgitTrackers &&
+      input.newgitTrackers.use.length + input.newgitTrackers.drop.length > 0
+    ) {
+      return yield* new GitCommandError({
+        operation: "GitVcsDriver.createWorktree",
+        command: "newgit spawn",
+        cwd: input.cwd,
+        detail:
+          "Trackers were chosen, but this worktree would not be a newgit workspace: the project has no .newgit/config.toml, or newgit cannot run here (T3CODE_NEWGIT=0, or no newgit binary).",
+      });
     }
     // Resolve sub/.. before taking the basename.
     const repoName = path.basename(path.resolve(input.cwd));

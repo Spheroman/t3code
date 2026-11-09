@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 
 import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NewgitTrackerChoice } from "./git.ts";
 
 /** Uses the managed worktree folder; handoff detaches the provider, ending this turn and resuming there next run. */
 export const WorktreeMcpHandoffInput = Schema.Struct({
@@ -21,6 +22,8 @@ export const WorktreeMcpHandoffInput = Schema.Struct({
       description: "Default true.",
     }),
   ),
+  // newgit fork patch
+  newgitTrackers: Schema.optional(NewgitTrackerChoice),
   continuationPrompt: Schema.optional(
     TrimmedNonEmptyString.check(Schema.isMaxLength(120_000)).annotate({
       description: "Work to resume in the worktree next turn. Omitted: thread waits.",

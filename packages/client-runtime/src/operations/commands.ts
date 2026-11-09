@@ -162,6 +162,8 @@ interface StartThreadBootstrap {
     readonly baseBranch: string;
     readonly branch?: string;
     readonly startFromOrigin?: boolean;
+    // newgit fork patch: trackers the new newgit workspace binds beyond its defaults.
+    readonly newgitTrackers?: import("@t3tools/contracts").NewgitTrackerChoice;
   };
   readonly runSetupScript?: boolean;
 }
@@ -698,6 +700,9 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
             ...(prepareWorktree.startFromOrigin === undefined
               ? {}
               : { startFromOrigin: prepareWorktree.startFromOrigin }),
+            ...(prepareWorktree.newgitTrackers === undefined
+              ? {}
+              : { newgitTrackers: prepareWorktree.newgitTrackers }),
           }
         : bootstrap?.worktreePath
           ? {

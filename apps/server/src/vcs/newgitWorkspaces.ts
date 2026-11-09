@@ -3,7 +3,7 @@
  * Upstream files only carry small hooks into this module, so the fork rebases cleanly.
  * `T3CODE_NEWGIT=0` opts out; `T3CODE_NEWGIT_BIN` names a binary off the server's PATH.
  */
-import { GitCommandError } from "@t3tools/contracts";
+import { GitCommandError, type NewgitTracker, type NewgitTrackerChoice } from "@t3tools/contracts";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -20,6 +20,7 @@ import * as ProcessRunner from "../processRunner.ts";
 const SPAWN_TIMEOUT = Duration.minutes(15);
 const REMOVE_TIMEOUT = Duration.minutes(5);
 const LIFECYCLE_TIMEOUT = Duration.minutes(5);
+const LIST_TIMEOUT = Duration.seconds(30);
 
 // The fields of `spawn --json` this module reads; newgit reports more.
 const SpawnResource = Schema.Struct({
@@ -141,17 +142,86 @@ const describeResource = (resource: typeof SpawnResource.Type) => {
     : `${resource.name} (${resource.status})`;
 };
 
+const decodeTrackerList = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      trackers: Schema.Array(
+        Schema.Struct({
+          name: Schema.String,
+          parent: Schema.NullOr(Schema.String),
+          paths: Schema.Array(Schema.String),
+          git: Schema.Boolean,
+          role: Schema.NullOr(Schema.String),
+          priority: Schema.Number,
+          requires: Schema.Array(Schema.String),
+          selectable: Schema.Boolean,
+          default_bound: Schema.NullOr(Schema.Boolean),
+        }),
+      ),
+    }),
+  ),
+);
+
+/**
+ * `newgit tracker list --json` in the project at `cwd`: what a new workspace may bind,
+ * and what it binds by default. Null outside a newgit project, or when newgit can't run
+ * (an older newgit without `--json` included): the caller offers no choice then.
+ */
+export const listNewgitTrackers = Effect.fn("newgitWorkspaces.listNewgitTrackers")(function* (
+  cwd: string,
+) {
+  if (!(yield* projectUsesNewgit(cwd))) return null;
+  const listed = yield* runNewgit({
+    operation: "newgitWorkspaces.listTrackers",
+    cwd,
+    args: ["tracker", "list", "--json"],
+    timeout: LIST_TIMEOUT,
+  }).pipe(
+    Effect.flatMap((output) => decodeTrackerList(output.stdout)),
+    Effect.map(({ trackers }) =>
+      trackers.map((tracker): NewgitTracker => ({
+        name: tracker.name,
+        parent: tracker.parent,
+        paths: tracker.paths,
+        git: tracker.git,
+        role: tracker.role,
+        priority: tracker.priority,
+        requires: tracker.requires,
+        selectable: tracker.selectable,
+        defaultBound: tracker.default_bound,
+      })),
+    ),
+    Effect.catchCause((cause) =>
+      Effect.logWarning("newgit tracker list failed; offering no tracker choice", {
+        cwd,
+        cause,
+      }).pipe(Effect.as(null)),
+    ),
+  );
+  return listed;
+});
+
+const trackerArgs = (choice: NewgitTrackerChoice | undefined) => [
+  ...(choice?.use ?? []).flatMap((tracker) => ["--use", tracker]),
+  ...(choice?.drop ?? []).flatMap((tracker) => ["--drop", tracker]),
+];
+
 /**
  * `newgit spawn <name> --from <ref>` in the project at `cwd`. Returns the workspace
  * path, or None when newgit can't run so the caller falls back to a git worktree.
  * Exit 1 with a report means a resource didn't come up: open the workspace anyway.
  */
 export const spawnNewgitWorkspace = Effect.fn("newgitWorkspaces.spawnNewgitWorkspace")(
-  function* (input: { readonly cwd: string; readonly name: string; readonly from: string }) {
+  function* (input: {
+    readonly cwd: string;
+    readonly name: string;
+    readonly from: string;
+    readonly trackers?: NewgitTrackerChoice | undefined;
+  }) {
     const output = yield* runNewgit({
       operation: "newgitWorkspaces.spawn",
       cwd: input.cwd,
-      args: ["spawn", input.name, "--from", input.from, "--json"],
+      args: ["spawn", input.name, "--from", input.from, ...trackerArgs(input.trackers), "--json"],
       timeout: SPAWN_TIMEOUT,
       reportExitCodes: [1],
     }).pipe(
