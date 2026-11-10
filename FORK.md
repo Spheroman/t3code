@@ -5,6 +5,14 @@ This fork of [pingdotgg/t3code](https://github.com/pingdotgg/t3code) adds
 `.newgit/config.toml` at its root, "New worktree" creates a newgit instance
 instead of a Git worktree: `newgit spawn <branch> --from <base> --json`
 makes the branch, its workspace, and its bound trackers and resources.
+Below the base branch, the new-thread panel lists the project's trackers
+(`newgit tracker list --json`), set as a spawn binds them by default: a
+checkbox per tracker, and one dropdown per role (one of its trackers, or
+none). Each change adds `--use` or `--drop` to that spawn. Agents choose the
+same way with `newgitTrackers: { use, drop }` on `t3_thread_launch`'s
+worktree strategy, `delegate_task` (with `isolation: "worktree"`), and
+`t3_worktree_handoff`; `t3 thread start --worktree <base>` takes `--use` and
+`--drop`. A choice that would land in a plain Git worktree is refused.
 Settling the thread runs `newgit stop`, which releases its running
 resources but keeps the workspace. Unsettling it runs `newgit start`, and so
 does every turn before the agent starts. Deleting the thread runs

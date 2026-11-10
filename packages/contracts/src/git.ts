@@ -151,12 +151,24 @@ export const VcsListRefsInput = Schema.Struct({
 });
 export type VcsListRefsInput = typeof VcsListRefsInput.Type;
 
+// newgit fork patch: which trackers a new newgit workspace binds, beyond its defaults.
+// Names as `newgit spawn --use`/`--drop` take them; ignored outside a newgit project.
+export const NewgitTrackerChoice = Schema.Struct({
+  use: Schema.Array(TrimmedNonEmptyStringSchema),
+  drop: Schema.Array(TrimmedNonEmptyStringSchema),
+}).annotate({
+  description:
+    "newgit projects only: trackers the new workspace binds beyond its defaults, as `newgit spawn --use`/`--drop`; names from `newgit tracker list` in the project. Using a tracker in a role replaces the role's default. Rejected where the worktree would not be a newgit workspace.",
+});
+export type NewgitTrackerChoice = typeof NewgitTrackerChoice.Type;
+
 export const VcsCreateWorktreeInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
   refName: TrimmedNonEmptyStringSchema,
   newRefName: Schema.optional(TrimmedNonEmptyStringSchema),
   baseRefName: Schema.optional(TrimmedNonEmptyStringSchema),
   path: Schema.NullOr(TrimmedNonEmptyStringSchema),
+  newgitTrackers: Schema.optional(NewgitTrackerChoice),
 });
 export type VcsCreateWorktreeInput = typeof VcsCreateWorktreeInput.Type;
 
@@ -289,6 +301,35 @@ export const VcsListRefsResult = Schema.Struct({
   totalCount: NonNegativeInt,
 });
 export type VcsListRefsResult = typeof VcsListRefsResult.Type;
+
+// newgit fork patch: `newgit tracker list --json`, for choosing a new workspace's trackers.
+export const VcsListNewgitTrackersInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+});
+export type VcsListNewgitTrackersInput = typeof VcsListNewgitTrackersInput.Type;
+
+export const NewgitTracker = Schema.Struct({
+  /** As `newgit spawn --use` takes it: `t3code/repos`. */
+  name: Schema.String,
+  /** The tracker that defines it; null for root's. */
+  parent: Schema.NullOr(Schema.String),
+  paths: Schema.Array(Schema.String),
+  git: Schema.Boolean,
+  role: Schema.NullOr(Schema.String),
+  priority: Schema.Number,
+  requires: Schema.Array(Schema.String),
+  /** False for `root` and `access`, which every instance binds. */
+  selectable: Schema.Boolean,
+  /** What a spawn with no `--use`/`--drop` binds; null when the defaults cannot be met. */
+  defaultBound: Schema.NullOr(Schema.Boolean),
+});
+export type NewgitTracker = typeof NewgitTracker.Type;
+
+export const VcsListNewgitTrackersResult = Schema.Struct({
+  /** Null when `cwd` is not a newgit project, or newgit cannot run. */
+  trackers: Schema.NullOr(Schema.Array(NewgitTracker)),
+});
+export type VcsListNewgitTrackersResult = typeof VcsListNewgitTrackersResult.Type;
 
 export const VcsCreateWorktreeResult = Schema.Struct({
   worktree: VcsWorktree,

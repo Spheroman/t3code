@@ -2484,6 +2484,12 @@ const make = Effect.gen(function* () {
         input.interactionMode,
       );
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
+      if (input.newgitTrackers !== undefined && input.isolation !== "worktree") {
+        return yield* failure(
+          "invalid_request",
+          "newgitTrackers chooses a new worktree's trackers; pass it with isolation 'worktree'.",
+        );
+      }
       if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
         const project = yield* requireProject(parent.thread.projectId);
         const base = yield* gitDriver
@@ -2511,7 +2517,12 @@ const make = Effect.gen(function* () {
               ),
             );
         }
-        workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
+        workspaceStrategy = {
+          type: "worktree",
+          baseRef: base.commitSha,
+          startFromOrigin: false,
+          ...(input.newgitTrackers === undefined ? {} : { newgitTrackers: input.newgitTrackers }),
+        };
       }
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its

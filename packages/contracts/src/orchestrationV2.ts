@@ -56,6 +56,7 @@ import {
   OrchestrationGetTurnDiffResult,
 } from "./checkpointDiff.ts";
 import { ModelSelection } from "./modelSelection.ts";
+import { NewgitTrackerChoice } from "./git.ts";
 import {
   ThreadLinkedPullRequest,
   ThreadPullRequestLink,
@@ -673,6 +674,8 @@ export const OrchestrationV2ThreadLaunchWorkspaceStrategy = Schema.Union([
     baseRef: TrimmedNonEmptyString,
     branch: Schema.optional(TrimmedNonEmptyString),
     startFromOrigin: Schema.optional(Schema.Boolean),
+    // newgit fork patch: trackers the new newgit workspace binds beyond its defaults.
+    newgitTrackers: Schema.optional(NewgitTrackerChoice),
   }),
 ]);
 export type OrchestrationV2ThreadLaunchWorkspaceStrategy =

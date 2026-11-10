@@ -85,6 +85,7 @@ import {
   previewAnnotationContextReference,
 } from "../../lib/composerContextRecords";
 import { environmentServerConfigsAtom } from "../../state/server";
+import { newgitTrackerChoiceField } from "../../state/newgitTrackers";
 import { threadEnvironment } from "../../state/threads";
 import { runMobileComposerTransition } from "./draftHeroTransition";
 import { useClientSettingsHydrated } from "../../hooks/useSettings";
@@ -1218,6 +1219,7 @@ export function useComposerSend(input: ComposerSendInput) {
                       projectCwd: activeProject.workspaceRoot,
                       baseBranch: baseBranchForWorktree,
                       ...(startFromOrigin ? { startFromOrigin: true } : {}),
+                      ...newgitTrackerChoiceField(threadIdForSend),
                     },
                     runSetupScript: true,
                   }
