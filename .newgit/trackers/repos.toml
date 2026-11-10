@@ -5,3 +5,4 @@ mount = ".repos"
 paths = ["."]
 git = true
 priority = -1
+export = "inherit"
