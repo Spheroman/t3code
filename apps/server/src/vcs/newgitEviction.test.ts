@@ -3,11 +3,13 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ThreadId } from "@t3tools/contracts";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
+import { TestClock } from "effect/testing";
 
 import {
   newgitWorkspaceIdle,
@@ -135,17 +137,48 @@ describe("newgit eviction", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("yields why `newgit start` could not restore the workspace", () =>
+  it.effect("yields newgit's warnings and error when `newgit start` could not restore", () =>
     Effect.gen(function* () {
+      const longCause = "x".repeat(5000);
       const workspace = yield* setup(
-        "echo 'Error: `feature` was evicted, but its path holds more than its marker now' >&2\nexit 1",
+        "echo '[newgit] warning: kept what was at the path in /w/.feature.restore-failed; no checkpoint holds it' >&2\n" +
+          "echo '[newgit] warning: discard it with: newgit cleanup --discard-saved /w/.feature.restore-failed' >&2\n" +
+          "echo 'restoring from ckpt_004, Error: is not the cause' >&2\n" +
+          `echo 'Error: restoring \`feature\` failed: ${longCause}' >&2\n` +
+          "echo 'Caused by: disk full' >&2\nexit 1",
       );
-      assert.strictEqual(
-        yield* startNewgitInstance(workspace.dir),
-        "`feature` was evicted, but its path holds more than its marker now",
+      const { failure } = yield* startNewgitInstance(workspace.dir);
+      const lines = failure?.split("\n") ?? [];
+      assert.deepEqual(lines.slice(0, 2), [
+        "kept what was at the path in /w/.feature.restore-failed; no checkpoint holds it",
+        "discard it with: newgit cleanup --discard-saved /w/.feature.restore-failed",
+      ]);
+      assert.isTrue(lines[2]!.startsWith("restoring `feature` failed: xxx"));
+      assert.isBelow(failure!.length, 3000);
+
+      const started = yield* setup(
+        `echo '{"resources":[],"restored":{"checkpoint":"ckpt_004"},"warnings":["saved copy at /w/.feature.restore-failed"]}'`,
       );
-      const started = yield* setup(`echo '{"resources":[],"restored":{"checkpoint":"ckpt_004"}}'`);
-      assert.isNull(yield* startNewgitInstance(started.dir));
+      assert.deepEqual(yield* startNewgitInstance(started.dir), {
+        failure: null,
+        warnings: ["saved copy at /w/.feature.restore-failed"],
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("runs no `newgit start` after a failed restore until the user acts again", () =>
+    Effect.gen(function* () {
+      const workspace = yield* setup("echo 'Error: restoring `feature` failed' >&2\nexit 1");
+      const failed = { failure: "restoring `feature` failed", warnings: [] };
+      assert.deepEqual(yield* startNewgitInstance(workspace.dir), failed);
+      // Automatic starts (unsettling, a retry), and a message sent before the failure, wait.
+      assert.deepEqual(yield* startNewgitInstance(workspace.dir), failed);
+      assert.deepEqual(yield* startNewgitInstance(workspace.dir, { userActedAt: 0 }), failed);
+      assert.lengthOf(yield* workspace.calls, 1);
+
+      yield* TestClock.adjust(Duration.seconds(5));
+      assert.deepEqual(yield* startNewgitInstance(workspace.dir, { userActedAt: 1000 }), failed);
+      assert.lengthOf(yield* workspace.calls, 2);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
@@ -169,6 +202,7 @@ describe("releaseIdleProviderSessions", () => {
   const release = (input: {
     readonly live: ReadonlyArray<string>;
     readonly sharedWithOthers?: ReadonlyArray<string>;
+    readonly unfinished?: ReadonlyArray<string>;
   }) => {
     const released: string[] = [];
     const sessionsByThread: Record<string, ReadonlyArray<string | null>> = {
@@ -190,9 +224,11 @@ describe("releaseIdleProviderSessions", () => {
           Effect.succeed(
             input.sharedWithOthers?.includes(providerSessionId) ? [ThreadId.make("other")] : [],
           ),
-        releaseUnlessBusy: ({ providerSessionId, ownProviderThreadIds, reason }) => {
+        hasUnfinishedWork: (providerSessionId) =>
+          Effect.succeed(input.unfinished?.includes(providerSessionId) ?? false),
+        releaseUnlessBusy: ({ providerSessionId, ownProviderThreadIds, keepIfUnfinishedWork }) => {
           assert.deepEqual(ownProviderThreadIds, []);
-          assert.strictEqual(reason, "idle_timeout");
+          assert.isTrue(keepIfUnfinishedWork);
           released.push(providerSessionId);
           return Effect.succeed(true);
         },
@@ -211,6 +247,18 @@ describe("releaseIdleProviderSessions", () => {
         ["session-parent", "session-child"],
       );
       assert.deepEqual(yield* release({ live: [] }), []);
+    }),
+  );
+
+  it.effect("releases none while any of them still has work", () =>
+    Effect.gen(function* () {
+      assert.deepEqual(
+        yield* release({
+          live: ["session-parent", "session-child"],
+          unfinished: ["session-child"],
+        }),
+        [],
+      );
     }),
   );
 });

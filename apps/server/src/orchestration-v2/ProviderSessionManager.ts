@@ -203,7 +203,18 @@ export interface ProviderSessionManagerV2Shape {
     readonly ownProviderThreadIds: ReadonlyArray<ProviderThreadId>;
     readonly reason: ProviderSessionReleaseReason;
     readonly detail?: string;
+    /**
+     * newgit fork patch: also keep it while `hasUnfinishedWork`, checked atomically with
+     * persisting requests.
+     */
+    readonly keepIfUnfinishedWork?: boolean;
   }) => Effect.Effect<boolean, ProviderSessionManagerV2Error>;
+  /**
+   * newgit fork patch: whether releasing the live session would lose work: background work its
+   * runtime reports, a provider thread's pending background task, or a live runtime request such
+   * as an approval or a question. False when it is not live.
+   */
+  readonly hasUnfinishedWork: (providerSessionId: ProviderSessionId) => Effect.Effect<boolean>;
   /**
    * Other threads with a run or background work on this session's shared process; empty when
    * it serves one thread.
@@ -1173,6 +1184,52 @@ export const layerWithOptions = (
           ),
         );
 
+      /** What the runtime itself reports still running; `ifUnknown` when the probe fails. */
+      const runtimeHasPendingWork = (
+        runtime: LiveSessionEntry["runtime"],
+        ifUnknown: boolean,
+      ): Effect.Effect<boolean> =>
+        runtime.hasPendingBackgroundWork === undefined
+          ? Effect.succeed(false)
+          : runtime.hasPendingBackgroundWork.pipe(
+              Effect.catchCause(() => Effect.succeed(ifUnknown)),
+            );
+
+      /**
+       * newgit fork patch: one rule for the idle timeout, linked environments, and eviction.
+       * Work a release would lose: the runtime's own background work, a provider thread's pending
+       * background task, or a live runtime request (an approval or question) on this session.
+       * Unreadable counts as unfinished.
+       */
+      const hasUnfinishedWork = (entry: LiveSessionEntry): Effect.Effect<boolean> => {
+        const providerSessionId = entry.runtime.providerSessionId;
+        const hasUnfinishedRecords = Effect.forEach(entry.attachedThreadIds, (threadId) =>
+          projectionStore.getThreadRecords(threadId, ["runtimeRequests", "providerThreads"], {
+            runtimeRequestStatuses: ["pending"],
+          }),
+        ).pipe(
+          Effect.map((projections) =>
+            projections.some(
+              (projection) =>
+                projection.runtimeRequests.some(
+                  (request) =>
+                    request.responseCapability.type === "live" &&
+                    request.responseCapability.providerSessionId === providerSessionId,
+                ) ||
+                projection.providerThreads.some(
+                  (providerThread) =>
+                    providerThread.providerSessionId === providerSessionId &&
+                    (providerThread.pendingBackgroundTasks ?? []).length > 0,
+                ),
+            ),
+          ),
+          Effect.orElseSucceed(() => true),
+        );
+        return runtimeHasPendingWork(entry.runtime, true).pipe(
+          Effect.flatMap((pending) => (pending ? Effect.succeed(true) : hasUnfinishedRecords)),
+        );
+      };
+
       const releaseIfStillIdle = Effect.fn("ProviderSessionManager.releaseIfStillIdle")(
         function* (input: {
           readonly providerSessionId: ProviderSessionId;
@@ -1190,12 +1247,7 @@ export const layerWithOptions = (
           }
           // Capture runtime identity before yielding; replacements can reuse the session id.
           const probedRuntime = entry.runtime;
-          const hasPendingWork =
-            probedRuntime.hasPendingBackgroundWork === undefined
-              ? false
-              : yield* probedRuntime.hasPendingBackgroundWork.pipe(
-                  Effect.catchCause(() => Effect.succeed(false)),
-                );
+          const hasPendingWork = yield* runtimeHasPendingWork(probedRuntime, false);
           if (hasPendingWork) {
             const now = yield* Clock.currentTimeMillis;
             const pinnedSinceMs = entry.pinnedSinceMs ?? now;
@@ -1834,42 +1886,13 @@ export const layerWithOptions = (
         const providerSessionId = entry.runtime.providerSessionId;
         // Any activity during these reads bumps the generation and keeps the runtime.
         const generation = entry.idleGeneration;
-        const hasPendingWork =
-          entry.runtime.hasPendingBackgroundWork === undefined
-            ? false
-            : yield* entry.runtime.hasPendingBackgroundWork.pipe(
-                Effect.catchCause(() => Effect.succeed(true)),
-              );
-        if (hasPendingWork) return;
-        // Checked under the request permit so a runless request mid-persist is not cancelled.
-        const hasUnfinishedRecords = Effect.forEach(entry.attachedThreadIds, (threadId) =>
-          projectionStore.getThreadRecords(threadId, ["runtimeRequests", "providerThreads"], {
-            runtimeRequestStatuses: ["pending"],
-          }),
-        ).pipe(
-          Effect.map((projections) =>
-            projections.some(
-              (projection) =>
-                projection.runtimeRequests.some(
-                  (request) =>
-                    request.responseCapability.type === "live" &&
-                    request.responseCapability.providerSessionId === providerSessionId,
-                ) ||
-                projection.providerThreads.some(
-                  (providerThread) =>
-                    providerThread.providerSessionId === providerSessionId &&
-                    (providerThread.pendingBackgroundTasks ?? []).length > 0,
-                ),
-            ),
-          ),
-          Effect.orElseSucceed(() => true),
-        );
         yield* releaseEntry({
           providerSessionId,
           reason: "idle_timeout",
           detail: "Linked environments changed; reopening the provider session.",
           onlyIfIdleGeneration: generation,
-          keepIf: hasUnfinishedRecords,
+          // Checked under the request permit so a runless request mid-persist is not cancelled.
+          keepIf: hasUnfinishedWork(entry),
         }).pipe(logReleaseFailure(providerSessionId));
       });
 
@@ -2647,10 +2670,27 @@ export const layerWithOptions = (
             reason: input.reason,
             ...(input.detail === undefined ? {} : { detail: input.detail }),
             keepIfBusyOtherThan: input.ownProviderThreadIds,
+            ...(input.keepIfUnfinishedWork === true
+              ? {
+                  keepIf: Ref.get(sessions).pipe(
+                    Effect.flatMap((current) => {
+                      const entry = current.get(key);
+                      return entry === undefined ? Effect.succeed(false) : hasUnfinishedWork(entry);
+                    }),
+                  ),
+                }
+              : {}),
           });
           // Identity, not presence: open can install a replacement under the same id meanwhile.
           return before !== undefined && (yield* Ref.get(sessions)).get(key) !== before;
         }),
+        hasUnfinishedWork: (providerSessionId) =>
+          Ref.get(sessions).pipe(
+            Effect.flatMap((current) => {
+              const entry = current.get(sessionKey(providerSessionId));
+              return entry === undefined ? Effect.succeed(false) : hasUnfinishedWork(entry);
+            }),
+          ),
         otherWorkingThreads: Effect.fn("ProviderSessionManager.otherWorkingThreads")(
           function* (input) {
             const entry = (yield* Ref.get(sessions)).get(sessionKey(input.providerSessionId));

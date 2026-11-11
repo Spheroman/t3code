@@ -20,7 +20,10 @@ sharing its workspace, such as a delegated child, are settled and run no
 terminal. It first releases those threads' idle provider sessions, whose
 `claude` or `codex` process works in the workspace, and runs newgit from the
 project root, naming the instance, since newgit refuses to delete a directory
-a process works in. That checkpoints the instance and deletes the workspace,
+a process works in. A session that still has work, such as a background
+command or subagent, an approval, or a question (a thread settled by hand
+can), is not released, nor is any other: its process keeps the workspace, and
+newgit refuses. That checkpoints the instance and deletes the workspace,
 leaving its marker. When the workspace holds what would not come back
 (ignored files nothing rebuilds, such as an undeclared `target/`, a rebase in
 progress, a shell still in it), newgit refuses and deletes nothing: the
@@ -29,7 +32,12 @@ server logs its reason and the workspace stays, stopped. It never passes
 Unsettling the thread runs `newgit start`, and so does every turn before the
 agent starts. `start` first brings an evicted workspace back from its
 checkpoint, at the same path; if it can't, the turn fails before the agent
-starts with newgit's reason, rather than running it in an empty folder.
+starts with newgit's reason, including where it kept what was at the path,
+rather than running it in an empty folder. Each failed restore keeps another
+full copy, so after one fails the server runs no `start` for that workspace
+until the user sends a message; unsettling and retries wait. What a later
+`start` warns, such as that a saved copy is still there, is shown once in the
+thread, not on every turn.
 Eviction is on by default: turn off **Free disk when a newgit
 thread settles** in Settings → Threads to keep settled workspaces on disk. Deleting the thread runs `newgit remove`. A new
 thread that starts from origin waits up to five minutes for its base

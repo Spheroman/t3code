@@ -53,6 +53,7 @@ import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import { releaseIdleProviderSessions } from "./ThreadSettlementService.ts";
 import * as CommandOutputHub from "./CommandOutputHub.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
@@ -2895,6 +2896,81 @@ it.effect(
           layerTest({ state, idleTimeoutMs: 60_000, capabilities: ExclusiveCapabilities }),
         ),
       );
+    }),
+);
+
+// newgit fork patch: settling a thread by hand does not wait for its work to finish, so evicting
+// its workspace must not release a session that still has work: newgit then refuses instead.
+it.effect.each(["a pending background task", "a live approval", "nothing unfinished"] as const)(
+  "ProviderSessionManagerV2 releases a settled thread's session for eviction with %s",
+  (work) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("thread-provider-session-manager-newgit-evict");
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId, now }),
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated",
+              threadId,
+              driver: CODEX_DRIVER,
+              occurredAt: now,
+              payload:
+                work === "a pending background task"
+                  ? {
+                      ...providerThread,
+                      pendingBackgroundTasks: [
+                        {
+                          taskId: "dev-server",
+                          kind: "command",
+                          description: "python3 -m http.server",
+                        },
+                      ],
+                    }
+                  : providerThread,
+            },
+          ],
+        });
+        yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        if (work === "a live approval") {
+          const pending = yield* makePendingRuntimeRequestEvents({
+            idAllocator,
+            threadId,
+            providerSessionId,
+            providerThread,
+            now,
+          });
+          yield* eventSink.write({ events: pending.events });
+        }
+
+        yield* releaseIdleProviderSessions(
+          {
+            getThreadRecords: (id, fields) =>
+              projectionStore.getThreadRecords(id, fields).pipe(Effect.orDie),
+          },
+          manager,
+          [threadId],
+        );
+
+        assert.strictEqual(yield* manager.isLive(providerSessionId), work !== "nothing unfinished");
+      }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
     }),
 );
 

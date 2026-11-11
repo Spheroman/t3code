@@ -5,6 +5,7 @@
  */
 import { GitCommandError, type NewgitTracker, type NewgitTrackerChoice } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -301,8 +302,9 @@ const decodeLifecycleOutput = Schema.decodeUnknownEffect(
 
 // One permit per instance, so a turn's `start` waits out a settle's `stop` still running.
 const instanceLocks = new Map<string, Semaphore.Semaphore>();
+const instanceKey = (workspace: NewgitWorkspace) => `${workspace.storeRoot}\0${workspace.name}`;
 const instanceLock = (workspace: NewgitWorkspace) => {
-  const key = `${workspace.storeRoot}\0${workspace.name}`;
+  const key = instanceKey(workspace);
   let lock = instanceLocks.get(key);
   if (lock === undefined) {
     lock = Semaphore.makeUnsafe(1);
@@ -314,28 +316,90 @@ const instanceLock = (workspace: NewgitWorkspace) => {
 const lifecycleArgs = (verb: "stop" | "evict" | "start", name: string) =>
   verb === "evict" ? ["stop", name, "--evict", "--json"] : [verb, name, "--json"];
 
-// A command newgit refused exits 1 with no report, and `Error: <why>` after any warnings on stderr.
+const WARNING_PREFIX = "[newgit] warning: ";
+const ERROR_PREFIX = "Error: ";
+const MAX_REASON_LINE = 600;
+const MAX_REASON_WARNINGS = 12;
+const MAX_REASON_ERROR = 2000;
+
+const clip = (text: string, max: number) =>
+  text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
+
+/**
+ * A command newgit refused exits 1 with no report. Its stderr holds `[newgit] warning:` lines,
+ * such as where a failed restore kept what was at the path, then `Error: <why>` last. The reason
+ * is those warnings, then the error, each line clipped on its own so no warning is lost to a
+ * long error.
+ */
 const newgitError = (stderr: string) => {
-  const at = stderr.indexOf("Error: ");
-  return (at === -1 ? stderr : stderr.slice(at + "Error: ".length)).trim();
+  const lines = stderr.split(/\r?\n/);
+  const errorAt = lines.findLastIndex((line) => line.startsWith(ERROR_PREFIX));
+  const warnings = (errorAt === -1 ? lines : lines.slice(0, errorAt))
+    .filter((line) => line.startsWith(WARNING_PREFIX))
+    .map((line) => clip(line.slice(WARNING_PREFIX.length).trim(), MAX_REASON_LINE))
+    .filter((line) => line !== "");
+  const error =
+    errorAt === -1
+      ? warnings.length > 0
+        ? ""
+        : stderr.trim()
+      : lines.slice(errorAt).join("\n").slice(ERROR_PREFIX.length).trim();
+  return [
+    ...warnings.slice(0, MAX_REASON_WARNINGS),
+    ...(warnings.length > MAX_REASON_WARNINGS
+      ? [`(${warnings.length - MAX_REASON_WARNINGS} more warnings)`]
+      : []),
+    ...(error === "" ? [] : [clip(error, MAX_REASON_ERROR)]),
+  ].join("\n");
 };
+
+interface LifecycleOutcome {
+  /** Why newgit did not do it, or null. */
+  readonly failure: string | null;
+  /** What a successful run warned, such as saved copies a failed restore left. */
+  readonly warnings: ReadonlyArray<string>;
+}
+const succeeded = (warnings: ReadonlyArray<string> = []): LifecycleOutcome => ({
+  failure: null,
+  warnings,
+});
+
+/**
+ * Each failed restore moves what is at the path aside into another full saved copy, so after one
+ * fails nothing restores that workspace again until someone acts. Keyed like `instanceLocks`.
+ */
+const restoreFailures = new Map<string, { readonly reason: string; readonly atMs: number }>();
 
 /**
  * `newgit stop|start <name>` (or `stop --evict`), run from the project root so our cwd is never
- * in the workspace; a no-op outside one. Never fails: yields why newgit did not, or null.
- * `stillWanted` is checked under the instance lock. A start may restore a workspace: spawn's time.
+ * in the workspace; a no-op outside one. Never fails. `stillWanted` is checked under the instance
+ * lock. A start may restore a workspace: spawn's time. A start with a restore failed since
+ * `userActedAt` (always, when absent) does not run and yields that failure.
  */
 const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
   function* (
     verb: "stop" | "evict" | "start",
     worktreePath: string,
     stillWanted: Effect.Effect<boolean>,
+    userActedAt?: number,
   ) {
     const workspace = yield* readNewgitWorkspace(worktreePath);
-    if (workspace === null) return null;
+    if (workspace === null) return succeeded();
+    const key = instanceKey(workspace);
     return yield* instanceLock(workspace).withPermits(1)(
       Effect.gen(function* () {
-        if (!(yield* stillWanted)) return null;
+        if (!(yield* stillWanted)) return succeeded();
+        let restoring = false;
+        if (verb === "start") {
+          const failed = restoreFailures.get(key);
+          if (failed !== undefined) {
+            if (userActedAt === undefined || userActedAt <= failed.atMs) {
+              return { failure: failed.reason, warnings: [] } satisfies LifecycleOutcome;
+            }
+            restoreFailures.delete(key);
+          }
+          restoring = yield* isEvictedNewgitWorkspace(worktreePath);
+        }
         const { stdout, stderr, exitCode } = yield* runNewgit({
           operation: `newgitWorkspaces.${verb}`,
           cwd: workspace.storeRoot,
@@ -354,7 +418,10 @@ const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
           } else {
             yield* Effect.logWarning(`newgit ${verb} failed`, { instance: workspace.name, reason });
           }
-          return reason;
+          if (restoring) {
+            restoreFailures.set(key, { reason, atMs: yield* Clock.currentTimeMillis });
+          }
+          return { failure: reason, warnings: [] } satisfies LifecycleOutcome;
         }
         const {
           resources,
@@ -386,7 +453,7 @@ const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
             checkpoint: restored.checkpoint,
           });
         }
-        return null;
+        return succeeded(warnings);
       }),
     );
   },
@@ -394,13 +461,14 @@ const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
     effect.pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning(`newgit ${verb} failed`, { worktreePath, cause }).pipe(
-          Effect.as(
-            Option.match(Cause.findErrorOption(cause), {
+          Effect.as<LifecycleOutcome>({
+            failure: Option.match(Cause.findErrorOption(cause), {
               onNone: () => `newgit ${verb} failed`,
               onSome: (error) =>
                 isGitCommandError(error) ? error.detail : `newgit ${verb} failed`,
             }),
-          ),
+            warnings: [],
+          }),
         ),
       ),
     ),
@@ -422,10 +490,14 @@ export const evictNewgitInstance = (worktreePath: string, stillWanted: Effect.Ef
 
 /**
  * Bring back what the last `stopNewgitInstance` released, and an evicted workspace first;
- * cheap when nothing was. Yields newgit's reason when it could not, or null.
+ * cheap when nothing was. Yields why newgit could not, and what it warned when it could.
+ * Once a restore fails, no start runs for that workspace again until one passes a
+ * `userActedAt` (epoch ms) later than the failure: a message the user sent after it.
  */
-export const startNewgitInstance = (worktreePath: string) =>
-  runLifecycle("start", worktreePath, Effect.succeed(true));
+export const startNewgitInstance = (
+  worktreePath: string,
+  options: { readonly userActedAt?: number | undefined } = {},
+) => runLifecycle("start", worktreePath, Effect.succeed(true), options.userActedAt);
 
 /** Whether `worktreePath` is a newgit workspace that is still evicted: its marker, but no clone. */
 export const isEvictedNewgitWorkspace = Effect.fn("newgitWorkspaces.isEvictedNewgitWorkspace")(

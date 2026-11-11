@@ -7,6 +7,7 @@ import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 import {
   CommandId,
   isOrchestrationV2WorkActive,
+  type ProviderSessionId,
   type ThreadId,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ThreadShell,
@@ -352,54 +353,59 @@ export const newgitWorkspaceIdle = (
   );
 
 /**
- * newgit fork patch: an idle provider process (`claude`, `codex app-server`) keeps its cwd in the
- * workspace until its idle timeout, and newgit refuses to evict a directory a process works in.
- * Release the threads' sessions no turn is busy on and no other thread shares; the next turn
- * resumes them, as after an idle timeout.
+ * newgit fork patch: newgit refuses to evict a directory a process works in, and an idle provider
+ * process keeps its cwd there. Release the sessions the threads alone hold, unless any still has
+ * work a release would lose; then release none, and newgit refuses. The next turn resumes them.
  */
-export const releaseIdleProviderSessions = (
-  orchestrator: Pick<Orchestrator.OrchestratorV2Shape, "getThreadRecords">,
-  sessions: Pick<
-    ProviderSessionManager.ProviderSessionManagerV2Shape,
-    "isLive" | "otherWorkingThreads" | "releaseUnlessBusy"
-  >,
-  threadIds: ReadonlyArray<ThreadId>,
-) =>
-  Effect.forEach(
-    threadIds,
-    (threadId) =>
-      orchestrator.getThreadRecords(threadId, ["providerThreads"]).pipe(
-        Effect.flatMap((records) =>
-          Effect.forEach(
-            new Set(
-              records.providerThreads.flatMap((providerThread) =>
-                providerThread.providerSessionId === null ? [] : [providerThread.providerSessionId],
-              ),
-            ),
-            (providerSessionId) =>
-              Effect.gen(function* () {
-                if (!(yield* sessions.isLive(providerSessionId))) return;
-                const others = yield* sessions.otherWorkingThreads({ providerSessionId, threadId });
-                if (others.length > 0) return;
-                yield* sessions.releaseUnlessBusy({
-                  providerSessionId,
-                  ownProviderThreadIds: [],
-                  reason: "idle_timeout",
-                  detail: "Thread settled; its newgit workspace is being evicted.",
-                });
-              }),
-            { discard: true },
-          ),
-        ),
-        Effect.catchCause((cause) =>
-          Effect.logWarning("releasing a settled thread's provider session failed", {
+export const releaseIdleProviderSessions = Effect.fn(
+  "ThreadSettlementService.releaseIdleProviderSessions",
+)(
+  function* (
+    orchestrator: Pick<Orchestrator.OrchestratorV2Shape, "getThreadRecords">,
+    sessions: Pick<
+      ProviderSessionManager.ProviderSessionManagerV2Shape,
+      "isLive" | "otherWorkingThreads" | "hasUnfinishedWork" | "releaseUnlessBusy"
+    >,
+    threadIds: ReadonlyArray<ThreadId>,
+  ) {
+    const releasable = new Set<ProviderSessionId>();
+    for (const threadId of threadIds) {
+      const records = yield* orchestrator.getThreadRecords(threadId, ["providerThreads"]);
+      for (const { providerSessionId } of records.providerThreads) {
+        if (providerSessionId === null || releasable.has(providerSessionId)) continue;
+        if (!(yield* sessions.isLive(providerSessionId))) continue;
+        const others = yield* sessions.otherWorkingThreads({ providerSessionId, threadId });
+        if (others.length > 0) continue;
+        if (yield* sessions.hasUnfinishedWork(providerSessionId)) {
+          yield* Effect.logInfo("a settled thread's provider session still has work", {
             threadId,
-            cause: Cause.pretty(cause),
-          }),
-        ),
+            providerSessionId,
+          });
+          return;
+        }
+        releasable.add(providerSessionId);
+      }
+    }
+    for (const providerSessionId of releasable) {
+      yield* sessions.releaseUnlessBusy({
+        providerSessionId,
+        ownProviderThreadIds: [],
+        reason: "idle_timeout",
+        detail: "Thread settled; its newgit workspace is being evicted.",
+        keepIfUnfinishedWork: true,
+      });
+    }
+  },
+  (effect, _orchestrator, _sessions, threadIds) =>
+    effect.pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("releasing a settled thread's provider sessions failed", {
+          threadIds,
+          cause: Cause.pretty(cause),
+        }),
       ),
-    { discard: true },
-  );
+    ),
+);
 
 export const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;

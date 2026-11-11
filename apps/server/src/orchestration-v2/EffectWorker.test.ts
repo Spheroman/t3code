@@ -113,6 +113,8 @@ function layerExecutorFor(input: {
         release: () => record("release"),
         detach: () => record("detach"),
         otherWorkingThreads: () => Effect.succeed([]),
+        // newgit fork patch
+        hasUnfinishedWork: () => Effect.succeed(false),
         releaseUnlessBusy: () => Effect.succeed(true),
         subscribePromptSuggestion: () => Stream.empty,
       }),
