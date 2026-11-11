@@ -649,6 +649,15 @@ export const SETTINGS_SEARCH_ITEMS = [
     requiresThreadAutoSettlement: true,
     scope: "project-defaults",
   },
+  // newgit fork patch
+  {
+    id: "newgit-evict-settled-workspaces",
+    title: "Free disk when a newgit thread settles",
+    to: "/settings/threads",
+    searchTerms: ["newgit evict workspace checkpoint delete disk space settle restore"],
+    environmentOnly: true,
+    scope: "environment-defaults",
+  },
   {
     id: "days-before-auto-settle",
     title: "Days of inactivity before auto-settle",

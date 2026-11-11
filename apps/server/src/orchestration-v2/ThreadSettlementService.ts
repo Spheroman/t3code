@@ -19,7 +19,9 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FiberSet from "effect/FiberSet";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as Schedule from "effect/Schedule";
 import * as Semaphore from "effect/Semaphore";
 import type * as Scope from "effect/Scope";
@@ -32,6 +34,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import { forkParked } from "../serverActivation.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import * as NewgitWorkspaces from "../vcs/newgitWorkspaces.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -297,6 +300,46 @@ export function autoSettlementSettingsKey(
   ]);
 }
 
+/**
+ * newgit fork patch: whether a settled thread's newgit workspace may be evicted. It and every
+ * unarchived thread sharing the workspace, such as a delegated child, must be settled with no
+ * terminal running. An archived thread's next turn restores the workspace, as any turn does.
+ */
+export const newgitWorkspaceIdle = (
+  projections: Pick<
+    ProjectionStore.ProjectionStoreV2["Service"],
+    "getThread" | "getThreadWorktreePaths"
+  >,
+  terminals: Pick<TerminalManager.TerminalManager["Service"], "threadHasRunningSessions">,
+  threadId: ThreadId,
+  worktreePath: string,
+): Effect.Effect<boolean> =>
+  projections.getThreadWorktreePaths().pipe(
+    Effect.map((rows) => [
+      threadId,
+      ...rows
+        .filter((row) => row.worktreePath === worktreePath && row.threadId !== threadId)
+        .map((row) => row.threadId),
+    ]),
+    Effect.flatMap((threadIds) =>
+      Effect.forEach(threadIds, (id) =>
+        projections
+          .getThread(id)
+          .pipe(
+            Effect.flatMap((thread) =>
+              thread.settledOverride === "settled"
+                ? terminals
+                    .threadHasRunningSessions({ threadId: id })
+                    .pipe(Effect.map((running) => !running))
+                : Effect.succeed(false),
+            ),
+          ),
+      ),
+    ),
+    Effect.map((idle) => idle.every(Boolean)),
+    Effect.orElseSucceed(() => false),
+  );
+
 export const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -312,6 +355,21 @@ export const make = Effect.gen(function* () {
   const shellClosedThreads = new Set<ThreadId>();
   const terminals = yield* TerminalManager.TerminalManager;
   const projectScripts = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
+  // newgit fork patch: a settled thread's newgit workspace is evicted after its settle action.
+  // The spawner is optional so upstream's tests, which don't provide one, build this unchanged.
+  const newgitSpawner = yield* Effect.serviceOption(ChildProcessSpawner.ChildProcessSpawner);
+  const evictNewgitWorkspace = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    worktreePath: string,
+  ) {
+    if (Option.isNone(newgitSpawner)) return;
+    if (!(yield* settingsService.getSettings).newgitEvictSettledWorkspaces) return;
+    // Checked under the instance lock, so a thread unsettled in the meantime keeps its workspace.
+    const stillWanted = newgitWorkspaceIdle(projections, terminals, threadId, worktreePath);
+    yield* NewgitWorkspaces.evictNewgitInstance(worktreePath, stillWanted).pipe(
+      NewgitWorkspaces.provideNewgitServices({ fileSystem, path, spawner: newgitSpawner.value }),
+    );
+  });
   // Repeated thread.settled retains settledAt; run the action only once per settlement.
   const settleActionRunAt = new Map<ThreadId, number>();
 
@@ -617,8 +675,12 @@ export const make = Effect.gen(function* () {
         observeCompletion: {},
       });
       settleActionRunAt.set(threadId, settledAtMs);
+      // newgit fork patch: evict once the settle action is done with the workspace.
+      const evict = evictNewgitWorkspace(threadId, worktreePath);
       if (run.status === "started" && run.completion) {
-        yield* run.completion.pipe(Effect.forkDetach);
+        yield* run.completion.pipe(Effect.andThen(evict), Effect.forkDetach);
+      } else {
+        yield* evict.pipe(Effect.forkDetach);
       }
     },
     (effect, threadId) =>

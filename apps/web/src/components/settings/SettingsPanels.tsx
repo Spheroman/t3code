@@ -501,6 +501,11 @@ export function useSettingsRestore(onRestored?: () => void) {
     ...(settings.sidebarAutoSettleOnMerge !== DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleOnMerge
       ? ["Auto-settle merged threads"]
       : []),
+    // newgit fork patch
+    ...(settings.newgitEvictSettledWorkspaces !==
+    DEFAULT_UNIFIED_SETTINGS.newgitEvictSettledWorkspaces
+      ? ["Free disk when a newgit thread settles"]
+      : []),
     ...(settings.autoResumeLimitedThreads !== DEFAULT_UNIFIED_SETTINGS.autoResumeLimitedThreads
       ? ["Resume after usage limits"]
       : []),
@@ -663,6 +668,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       sidebarAutoSettleAfterDays: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleAfterDays,
       sidebarAutoSettleKeepPullRequests: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleKeepPullRequests,
       sidebarAutoSettleOnMerge: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleOnMerge,
+      newgitEvictSettledWorkspaces: DEFAULT_UNIFIED_SETTINGS.newgitEvictSettledWorkspaces,
       autoResumeLimitedThreads: DEFAULT_UNIFIED_SETTINGS.autoResumeLimitedThreads,
       snoozeLimitedThreads: DEFAULT_UNIFIED_SETTINGS.snoozeLimitedThreads,
       snoozePresets: DEFAULT_UNIFIED_SETTINGS.snoozePresets,
@@ -1776,6 +1782,25 @@ export function ThreadsSettingsPanel() {
                     updateSettings({ sidebarAutoSettleKeepPullRequests: checked })
                   }
                   aria-label="Keep threads with a PR"
+                />
+              }
+            />
+          ) : null}
+          {/* newgit fork patch */}
+          {!isProjectScope ? (
+            <SettingsRow
+              serverScoped
+              settingKeys={["newgitEvictSettledWorkspaces"]}
+              {...searchableSetting("newgit-evict-settled-workspaces")}
+              description="On by default. In newgit projects, settling a thread saves a checkpoint and deletes its workspace. Un-settling or messaging the thread brings it back. Ignored build output such as target/ is not kept."
+              control={
+                <ScopedSwitch
+                  settingKeys={["newgitEvictSettledWorkspaces"]}
+                  checked={settings.newgitEvictSettledWorkspaces}
+                  onCheckedChange={(checked) =>
+                    updateSettings({ newgitEvictSettledWorkspaces: Boolean(checked) })
+                  }
+                  aria-label="Free disk when a newgit thread settles"
                 />
               }
             />

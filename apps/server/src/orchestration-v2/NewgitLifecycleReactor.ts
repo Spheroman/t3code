@@ -1,6 +1,6 @@
 /**
  * newgit fork patch: settling a thread stops its newgit instance's resources, and unsettling
- * starts them again. The workspace stays until the thread is deleted (`newgit remove`). A new
+ * starts them again, restoring the workspace first if ThreadSettlementService evicted it. A new
  * turn on a settled thread starts them itself, awaited, in ProviderTurnStartService.
  */
 import type { OrchestrationV2DomainEvent } from "@t3tools/contracts";

@@ -1245,6 +1245,62 @@ effectIt.effect(
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
 );
 
+// newgit fork patch: an evicted workspace that `newgit start` did not bring back holds only its
+// marker, so the agent must not start there.
+const swapNewgitBin = (value: string | undefined) => {
+  const previous = process.env.T3CODE_NEWGIT_BIN;
+  if (value === undefined) delete process.env.T3CODE_NEWGIT_BIN;
+  else process.env.T3CODE_NEWGIT_BIN = value;
+  return previous;
+};
+effectIt.effect(
+  "fails a turn before provider start when its evicted newgit workspace stays gone",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const worktreesDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-newgit-evicted-",
+      });
+      const worktreePath = path.join(worktreesDir, "project", "restore");
+      yield* fileSystem.makeDirectory(path.join(worktreePath, ".newgit", "local"), {
+        recursive: true,
+      });
+      yield* fileSystem.writeFileString(
+        path.join(worktreePath, ".newgit", "local", "instance.toml"),
+        `branch = "feature"\nstore_root = "${worktreesDir}"\n`,
+      );
+      const bin = path.join(worktreesDir, "newgit");
+      yield* fileSystem.writeFileString(bin, "#!/bin/sh\necho 'restore refused' >&2\nexit 2\n");
+      yield* fileSystem.chmod(bin, 0o755);
+      yield* Effect.acquireRelease(
+        Effect.sync(() => swapNewgitBin(bin)),
+        (previous) => Effect.sync(() => swapNewgitBin(previous)),
+      );
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        worktreesDir,
+        worktreePath,
+        fileSystem,
+      });
+
+      yield* harness.start;
+
+      expect(harness.open).not.toHaveBeenCalled();
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(harness.projection().runs.at(-1)).toMatchObject({ status: "failed", startedAt: null });
+      expect(harness.projection().turnItems).toMatchObject([
+        {
+          type: "error",
+          title: "Couldn't restore thread workspace",
+          failure: {
+            message: `newgit could not restore this thread's workspace at ${worktreePath}. Run \`newgit start\` there to see why.`,
+          },
+        },
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+);
+
 effectIt.effect("recovers an abandoned failed turn before continuing its native conversation", () =>
   Effect.gen(function* () {
     const harness = makeLocalCommandHarness({
