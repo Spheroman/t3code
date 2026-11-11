@@ -18,6 +18,7 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  TurnItemId,
   ProjectId,
   type OrchestrationV2ThreadProjection,
   OrchestrationV2DomainEvent,
@@ -277,6 +278,8 @@ function makeLocalCommandHarness(input: {
   readonly fileSystem?: FileSystem.FileSystem;
   readonly previousNativeSession?: boolean;
   readonly previousMessages?: ReadonlyArray<string>;
+  /** `system_notice` messages an earlier run of the thread already showed. */
+  readonly previousNotices?: ReadonlyArray<string>;
   readonly logoutFailure?: string;
   readonly openFailure?: unknown;
   readonly ensureThreadFailure?: unknown;
@@ -471,7 +474,24 @@ function makeLocalCommandHarness(input: {
     providerTurns: [],
     contextHandoffs: [],
     contextTransfers: [],
-    turnItems: [],
+    turnItems: (input.previousNotices ?? []).map((text, index) => ({
+      id: TurnItemId.make(`previous-notice-${index}`),
+      threadId,
+      runId: RunId.make("run-previous"),
+      nodeId: NodeId.make("root-previous"),
+      providerThreadId,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: index + 1,
+      status: "completed" as const,
+      title: "newgit",
+      startedAt: now,
+      completedAt: now,
+      updatedAt: now,
+      type: "system_notice" as const,
+      message: text,
+    })),
     visibleTurnItems: [],
     runtimeRequests: [],
     subagents: [],
@@ -1246,7 +1266,7 @@ effectIt.effect(
 );
 
 // newgit fork patch: an evicted workspace that `newgit start` did not bring back holds only its
-// marker, so the agent must not start there.
+// marker, so the agent must not start there, and the user sees newgit's reason.
 const swapNewgitBin = (value: string | undefined) => {
   const previous = process.env.T3CODE_NEWGIT_BIN;
   if (value === undefined) delete process.env.T3CODE_NEWGIT_BIN;
@@ -1271,7 +1291,10 @@ effectIt.effect(
         `branch = "feature"\nstore_root = "${worktreesDir}"\n`,
       );
       const bin = path.join(worktreesDir, "newgit");
-      yield* fileSystem.writeFileString(bin, "#!/bin/sh\necho 'restore refused' >&2\nexit 2\n");
+      yield* fileSystem.writeFileString(
+        bin,
+        "#!/bin/sh\necho '[newgit] warning: kept what was at the path in .restore.restore-failed; discard it with `newgit cleanup --discard-saved`' >&2\necho 'Error: restoring `feature` failed (disk full); the workspace is back to its marker' >&2\nexit 1\n",
+      );
       yield* fileSystem.chmod(bin, 0o755);
       yield* Effect.acquireRelease(
         Effect.sync(() => swapNewgitBin(bin)),
@@ -1294,11 +1317,68 @@ effectIt.effect(
           type: "error",
           title: "Couldn't restore thread workspace",
           failure: {
-            message: `newgit could not restore this thread's workspace at ${worktreePath}. Run \`newgit start\` there to see why.`,
+            message: [
+              `newgit could not restore this thread's workspace at ${worktreePath}:`,
+              "kept what was at the path in .restore.restore-failed; discard it with `newgit cleanup --discard-saved`",
+              "restoring `feature` failed (disk full); the workspace is back to its marker",
+              "T3 Code won't try to restore it again until you send a message.",
+            ].join("\n"),
           },
         },
       ]);
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+);
+
+effectIt.effect("shows what a successful `newgit start` warned once per thread", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const worktreesDir = yield* fileSystem.makeTempDirectoryScoped({
+      prefix: "t3-newgit-warned-",
+    });
+    const worktreePath = path.join(worktreesDir, "project", "restore");
+    yield* fileSystem.makeDirectory(path.join(worktreePath, ".git"), { recursive: true });
+    yield* fileSystem.makeDirectory(path.join(worktreePath, ".newgit", "local"), {
+      recursive: true,
+    });
+    yield* fileSystem.writeFileString(
+      path.join(worktreePath, ".newgit", "local", "instance.toml"),
+      `branch = "feature"\nstore_root = "${worktreesDir}"\n`,
+    );
+    const warnings = [
+      "a saved copy of the path is at .restore.restore-failed; no checkpoint holds it",
+      "discard it with `newgit cleanup --discard-saved .restore.restore-failed`",
+    ];
+    const bin = path.join(worktreesDir, "newgit");
+    yield* fileSystem.writeFileString(
+      bin,
+      `#!/bin/sh\necho '${JSON.stringify({ resources: [], warnings })}'\n`,
+    );
+    yield* fileSystem.chmod(bin, 0o755);
+    yield* Effect.acquireRelease(
+      Effect.sync(() => swapNewgitBin(bin)),
+      (previous) => Effect.sync(() => swapNewgitBin(previous)),
+    );
+    const notices = (previousNotices?: ReadonlyArray<string>) =>
+      Effect.gen(function* () {
+        const harness = makeLocalCommandHarness({
+          text: "Continue",
+          worktreesDir,
+          worktreePath,
+          fileSystem,
+          previousTurn: { runStatus: "completed", turnStatus: "completed" },
+          ...(previousNotices === undefined ? {} : { previousNotices }),
+        });
+        yield* harness.start;
+        expect(harness.startRootRun).toHaveBeenCalledOnce();
+        return harness
+          .projection()
+          .turnItems.flatMap((item) => (item.type === "system_notice" ? [item.message] : []));
+      });
+
+    expect(yield* notices()).toEqual([warnings.join("\n")]);
+    expect(yield* notices([warnings.join("\n")])).toEqual([warnings.join("\n")]);
+  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
 );
 
 effectIt.effect("recovers an abandoned failed turn before continuing its native conversation", () =>

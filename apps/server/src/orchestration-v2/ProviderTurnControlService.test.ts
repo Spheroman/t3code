@@ -293,6 +293,8 @@ it.effect(
           release: () => Effect.void,
           detach: () => Effect.void,
           otherWorkingThreads: () => Effect.succeed([]),
+          // newgit fork patch
+          hasUnfinishedWork: () => Effect.succeed(false),
           releaseUnlessBusy: () => Effect.succeed(true),
           subscribePromptSuggestion: () => Stream.empty,
         }),

@@ -7,6 +7,7 @@ import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 import {
   CommandId,
   isOrchestrationV2WorkActive,
+  type ProviderSessionId,
   type ThreadId,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ThreadShell,
@@ -39,6 +40,7 @@ import * as ProjectStore from "./ProjectStore.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 
 export interface SettlementPullRequest {
   readonly state: "open" | "closed" | "merged";
@@ -300,6 +302,22 @@ export function autoSettlementSettingsKey(
   ]);
 }
 
+const newgitWorkspaceThreads = (
+  projections: Pick<ProjectionStore.ProjectionStoreV2["Service"], "getThreadWorktreePaths">,
+  threadId: ThreadId,
+  worktreePath: string,
+) =>
+  projections
+    .getThreadWorktreePaths()
+    .pipe(
+      Effect.map((rows) => [
+        threadId,
+        ...rows
+          .filter((row) => row.worktreePath === worktreePath && row.threadId !== threadId)
+          .map((row) => row.threadId),
+      ]),
+    );
+
 /**
  * newgit fork patch: whether a settled thread's newgit workspace may be evicted. It and every
  * unarchived thread sharing the workspace, such as a delegated child, must be settled with no
@@ -314,13 +332,7 @@ export const newgitWorkspaceIdle = (
   threadId: ThreadId,
   worktreePath: string,
 ): Effect.Effect<boolean> =>
-  projections.getThreadWorktreePaths().pipe(
-    Effect.map((rows) => [
-      threadId,
-      ...rows
-        .filter((row) => row.worktreePath === worktreePath && row.threadId !== threadId)
-        .map((row) => row.threadId),
-    ]),
+  newgitWorkspaceThreads(projections, threadId, worktreePath).pipe(
     Effect.flatMap((threadIds) =>
       Effect.forEach(threadIds, (id) =>
         projections
@@ -340,6 +352,61 @@ export const newgitWorkspaceIdle = (
     Effect.orElseSucceed(() => false),
   );
 
+/**
+ * newgit fork patch: newgit refuses to evict a directory a process works in, and an idle provider
+ * process keeps its cwd there. Release the sessions the threads alone hold, unless any still has
+ * work a release would lose; then release none, and newgit refuses. The next turn resumes them.
+ */
+export const releaseIdleProviderSessions = Effect.fn(
+  "ThreadSettlementService.releaseIdleProviderSessions",
+)(
+  function* (
+    orchestrator: Pick<Orchestrator.OrchestratorV2Shape, "getThreadRecords">,
+    sessions: Pick<
+      ProviderSessionManager.ProviderSessionManagerV2Shape,
+      "isLive" | "otherWorkingThreads" | "hasUnfinishedWork" | "releaseUnlessBusy"
+    >,
+    threadIds: ReadonlyArray<ThreadId>,
+  ) {
+    const releasable = new Set<ProviderSessionId>();
+    for (const threadId of threadIds) {
+      const records = yield* orchestrator.getThreadRecords(threadId, ["providerThreads"]);
+      for (const { providerSessionId } of records.providerThreads) {
+        if (providerSessionId === null || releasable.has(providerSessionId)) continue;
+        if (!(yield* sessions.isLive(providerSessionId))) continue;
+        const others = yield* sessions.otherWorkingThreads({ providerSessionId, threadId });
+        if (others.length > 0) continue;
+        if (yield* sessions.hasUnfinishedWork(providerSessionId)) {
+          yield* Effect.logInfo("a settled thread's provider session still has work", {
+            threadId,
+            providerSessionId,
+          });
+          return;
+        }
+        releasable.add(providerSessionId);
+      }
+    }
+    for (const providerSessionId of releasable) {
+      yield* sessions.releaseUnlessBusy({
+        providerSessionId,
+        ownProviderThreadIds: [],
+        reason: "idle_timeout",
+        detail: "Thread settled; its newgit workspace is being evicted.",
+        keepIfUnfinishedWork: true,
+      });
+    }
+  },
+  (effect, _orchestrator, _sessions, threadIds) =>
+    effect.pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("releasing a settled thread's provider sessions failed", {
+          threadIds,
+          cause: Cause.pretty(cause),
+        }),
+      ),
+    ),
+);
+
 export const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -358,17 +425,36 @@ export const make = Effect.gen(function* () {
   // newgit fork patch: a settled thread's newgit workspace is evicted after its settle action.
   // The spawner is optional so upstream's tests, which don't provide one, build this unchanged.
   const newgitSpawner = yield* Effect.serviceOption(ChildProcessSpawner.ChildProcessSpawner);
+  // Optional for the same reason.
+  const providerSessions = yield* Effect.serviceOption(
+    ProviderSessionManager.ProviderSessionManagerV2,
+  );
   const evictNewgitWorkspace = Effect.fnUntraced(function* (
     threadId: ThreadId,
     worktreePath: string,
   ) {
     if (Option.isNone(newgitSpawner)) return;
     if (!(yield* settingsService.getSettings).newgitEvictSettledWorkspaces) return;
-    // Checked under the instance lock, so a thread unsettled in the meantime keeps its workspace.
+    const withNewgit = NewgitWorkspaces.provideNewgitServices({
+      fileSystem,
+      path,
+      spawner: newgitSpawner.value,
+    });
+    if ((yield* NewgitWorkspaces.readNewgitWorkspace(worktreePath).pipe(withNewgit)) === null) {
+      return;
+    }
+    // Checked again under the instance lock, so a thread unsettled in the meantime keeps its workspace.
     const stillWanted = newgitWorkspaceIdle(projections, terminals, threadId, worktreePath);
-    yield* NewgitWorkspaces.evictNewgitInstance(worktreePath, stillWanted).pipe(
-      NewgitWorkspaces.provideNewgitServices({ fileSystem, path, spawner: newgitSpawner.value }),
-    );
+    if (!(yield* stillWanted)) return;
+    if (Option.isSome(providerSessions)) {
+      yield* newgitWorkspaceThreads(projections, threadId, worktreePath).pipe(
+        Effect.flatMap((threadIds) =>
+          releaseIdleProviderSessions(orchestrator, providerSessions.value, threadIds),
+        ),
+        Effect.orElseSucceed(() => undefined),
+      );
+    }
+    yield* NewgitWorkspaces.evictNewgitInstance(worktreePath, stillWanted).pipe(withNewgit);
   });
   // Repeated thread.settled retains settledAt; run the action only once per settlement.
   const settleActionRunAt = new Map<ThreadId, number>();

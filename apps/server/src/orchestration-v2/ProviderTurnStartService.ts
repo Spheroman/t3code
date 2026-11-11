@@ -89,9 +89,15 @@ class WorktreeRecreateError extends Schema.TaggedError<WorktreeRecreateError>()(
 // newgit fork patch: `newgit start` could not bring back a settled thread's evicted workspace.
 class NewgitRestoreError extends Schema.TaggedError<NewgitRestoreError>()("NewgitRestoreError", {
   worktreePath: Schema.String,
+  reason: Schema.NullOr(Schema.String),
 }) {
   override get message(): string {
-    return `newgit could not restore this thread's workspace at ${this.worktreePath}. Run \`newgit start\` there to see why.`;
+    const why =
+      this.reason === null
+        ? `newgit could not restore this thread's workspace at ${this.worktreePath}. Run \`newgit start\` there to see why.`
+        : `newgit could not restore this thread's workspace at ${this.worktreePath}:\n${this.reason}`;
+    // Each attempt sets aside another full copy of what is at the path.
+    return `${why}\nT3 Code won't try to restore it again until you send a message.`;
   }
 }
 
@@ -562,6 +568,67 @@ export const layer: Layer.Layer<
           });
         },
       );
+      // newgit fork patch: what `newgit start` warned, such as saved copies a failed restore left,
+      // shown once per thread: a later start repeats the same warnings until they are dealt with.
+      const noteNewgitWarnings = Effect.fn("ProviderTurnStartService.noteNewgitWarnings")(
+        function* (warnings: ReadonlyArray<string>) {
+          const text = warnings.join("\n");
+          const { turnItems } = yield* projectionStore.getThreadRecords(
+            projection.thread.id,
+            ["turnItems"],
+            { turnItemTypes: ["system_notice"] },
+          );
+          if (turnItems.some((item) => item.type === "system_notice" && item.message === text)) {
+            return;
+          }
+          const now = yield* DateTime.now;
+          const item: OrchestrationV2TurnItem = {
+            id: idAllocator.derive.runSignalTurnItem({ runId, signal: "newgit-start-warnings" }),
+            threadId: projection.thread.id,
+            runId,
+            nodeId: rootNode.id,
+            providerThreadId: providerThread.id,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal:
+              Math.max(
+                0,
+                ...projection.turnItems
+                  .filter((existing) => existing.runId === runId)
+                  .map((existing) => existing.ordinal),
+              ) + 1,
+            status: "completed",
+            title: "newgit",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "system_notice",
+            message: text,
+          };
+          yield* eventSink.writeIfRunCurrent({
+            threadId: projection.thread.id,
+            runId,
+            activeAttemptId: attempt.id,
+            expectedStatus: "starting",
+            events: [
+              {
+                type: "turn-item.updated",
+                payload: item,
+                id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+                threadId: projection.thread.id,
+                runId,
+                nodeId: rootNode.id,
+                providerInstanceId: run.providerInstanceId,
+                occurredAt: now,
+              },
+            ],
+          });
+        },
+        Effect.catchCause((cause) =>
+          Effect.logWarning("showing newgit's start warnings failed", { cause }),
+        ),
+      );
       if (message.attachments.length === 0 && message.text.trimStart().startsWith("/")) {
         const isEmptyCompaction =
           message.text.trim().toLowerCase() === "/compact" && !projection.hasConversation;
@@ -696,17 +763,27 @@ export const layer: Layer.Layer<
           path,
           spawner: newgitSpawner.value,
         });
-        yield* NewgitWorkspaces.startNewgitInstance(worktreePath).pipe(withNewgit);
-        // An evicted workspace that did not come back holds only its marker: don't run the agent there.
-        if (yield* NewgitWorkspaces.isEvictedNewgitWorkspace(worktreePath).pipe(withNewgit)) {
-          const error = new NewgitRestoreError({ worktreePath });
-          if (input.willRetry === true) return yield* error;
+        const wasEvicted =
+          yield* NewgitWorkspaces.isEvictedNewgitWorkspace(worktreePath).pipe(withNewgit);
+        // Only a message the user sent may retry a restore that already failed.
+        const userActed = message.createdBy === "user" && message.creationSource !== "server";
+        const started = yield* NewgitWorkspaces.startNewgitInstance(worktreePath, {
+          userActedAt: userActed ? DateTime.toEpochMillis(run.requestedAt) : undefined,
+        }).pipe(withNewgit);
+        // A failed restore leaves the marker, or what it found moved aside: don't run the agent there.
+        const stillEvicted =
+          yield* NewgitWorkspaces.isEvictedNewgitWorkspace(worktreePath).pipe(withNewgit);
+        if (stillEvicted || (wasEvicted && started.failure !== null)) {
+          // Not retried: a retry would not run `newgit start` again.
           yield* settleStartFailure({
             signal: "newgit-restore-failure",
             title: "Couldn't restore thread workspace",
-            error,
+            error: new NewgitRestoreError({ worktreePath, reason: started.failure }),
           });
           return;
+        }
+        if (started.warnings.length > 0) {
+          yield* noteNewgitWarnings(started.warnings);
         }
       }
       const selectInheritedBackgroundItems = (

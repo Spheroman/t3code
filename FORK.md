@@ -17,13 +17,28 @@ Settling the thread runs `newgit stop`, which releases its running
 resources at once. Once the thread's settle action is done, it also runs
 `newgit stop --evict`, but only if that thread and every unarchived thread
 sharing its workspace, such as a delegated child, are settled and run no
-terminal. That checkpoints the instance and deletes the workspace, leaving
-its marker. Ignored files that no tracker owns and no resource rebuilds,
-such as `target/`, are not kept. Unsettling the thread runs `newgit start`,
-and so does every turn before the agent starts. `start` first brings an
-evicted workspace back from its checkpoint, at the same path; if it can't,
-the turn fails before the agent starts, rather than running it in an empty
-folder. Eviction is on by default: turn off **Free disk when a newgit
+terminal. It first releases those threads' idle provider sessions, whose
+`claude` or `codex` process works in the workspace, and runs newgit from the
+project root, naming the instance, since newgit refuses to delete a directory
+a process works in. A session that still has work, such as a background
+command or subagent, an approval, or a question (a thread settled by hand
+can), is not released, nor is any other: its process keeps the workspace, and
+newgit refuses. That checkpoints the instance and deletes the workspace,
+leaving its marker. When the workspace holds what would not come back
+(ignored files nothing rebuilds, such as an undeclared `target/`, a rebase in
+progress, a shell still in it), newgit refuses and deletes nothing: the
+server logs its reason and the workspace stays, stopped. It never passes
+`--discard-ignored`; declare build output as a newgit resource instead.
+Unsettling the thread runs `newgit start`, and so does every turn before the
+agent starts. `start` first brings an evicted workspace back from its
+checkpoint, at the same path; if it can't, the turn fails before the agent
+starts with newgit's reason, including where it kept what was at the path,
+rather than running it in an empty folder. Each failed restore keeps another
+full copy, so after one fails the server runs no `start` for that workspace
+until the user sends a message; unsettling and retries wait. What a later
+`start` warns, such as that a saved copy is still there, is shown once in the
+thread, not on every turn.
+Eviction is on by default: turn off **Free disk when a newgit
 thread settles** in Settings → Threads to keep settled workspaces on disk. Deleting the thread runs `newgit remove`. A new
 thread that starts from origin waits up to five minutes for its base
 branch to fetch, instead of 30 seconds, since a newgit remote can be slow. Every other project gets plain worktrees, as upstream does.
@@ -78,7 +93,7 @@ upstream T3 Code, so both run at once:
   `existing_worktree` launches reject newgit workspaces, since they are
   separate clones rather than linked worktrees.
 - `stop` and `start` need a newgit with those commands (Spheroman/newgit#157),
-  and eviction needs one with `stop --evict`. With an older one they fail,
+  and eviction needs one with `stop --evict` (Spheroman/newgit#427). With an older one they fail,
   the server logs a warning, and settling and turns go on as before.
 - PR review guides still use their own temporary Git worktrees.
 - Sign-in flows that return through a `t3code://` link reach upstream
