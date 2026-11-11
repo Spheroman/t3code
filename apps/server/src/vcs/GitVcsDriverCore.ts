@@ -57,6 +57,8 @@ import * as ServerConfig from "../config.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+// newgit fork patch: a newgit remote can take minutes to serve a new thread's base branch.
+const WORKTREE_BASE_FETCH_TIMEOUT_MS = 5 * 60_000;
 /** T3's record of the branch, named as on the host, that a branch was cut from. */
 const branchBaseConfigKey = (branch: string) => `branch.${branch}.t3-merge-base`;
 /**
@@ -4618,11 +4620,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       return { headCommit: input.targetCommit, moved: true, onTarget: true };
     });
 
-  const fetchRemote = Effect.fn("fetchRemote")(function* (input: GitVcsDriver.GitFetchRemoteInput) {
+  const fetchRemote = Effect.fn("fetchRemote")(function* (
+    // newgit fork patch: `timeoutMs` lets a new thread's base fetch outlast a slow remote.
+    input: GitVcsDriver.GitFetchRemoteInput & { readonly timeoutMs?: number },
+  ) {
     const args = ["fetch", "--quiet", "--", input.remoteName];
     const options = {
       env: STATUS_UPSTREAM_REFRESH_ENV,
       fallbackErrorDetail: `git fetch ${input.remoteName} failed`,
+      ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
     };
     // Another fetch in the same repository, such as the background status
     // poll, can win the race for a remote-tracking ref. The loser fails, but
@@ -4758,7 +4764,14 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       const { remoteName, branchName } = target;
       const remoteRefName = `${remoteName}/${branchName}`;
       // A missing remote branch can leave a stale tracking ref; never resolve it.
-      if (!(yield* fetchRemote({ cwd: input.cwd, remoteName, refName: remoteRefName }))) {
+      if (
+        !(yield* fetchRemote({
+          cwd: input.cwd,
+          remoteName,
+          refName: remoteRefName,
+          timeoutMs: WORKTREE_BASE_FETCH_TIMEOUT_MS,
+        }))
+      ) {
         return null;
       }
       const resolved = yield* executeGit(

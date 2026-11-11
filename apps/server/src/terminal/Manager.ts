@@ -221,6 +221,11 @@ export class TerminalManager extends Context.Service<
 
     readonly closeOnSettle: (input: { readonly threadId: string }) => Effect.Effect<void>;
 
+    /** newgit fork patch: whether a thread still has a live terminal, before its workspace is evicted. */
+    readonly threadHasRunningSessions: (input: {
+      readonly threadId: string;
+    }) => Effect.Effect<boolean>;
+
     readonly closeIdle: (input: {
       readonly threadId: string;
       readonly terminalId?: string;
@@ -3479,6 +3484,14 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     yield* closeIdle(input);
   });
 
+  // newgit fork patch: a settled thread's workspace is evicted only once no terminal runs there.
+  const threadHasRunningSessions = (input: { readonly threadId: string }) =>
+    sessionsForThread(input.threadId).pipe(
+      Effect.map((sessions) =>
+        sessions.some((session) => session.status === "running" || session.status === "starting"),
+      ),
+    );
+
   return TerminalManager.of({
     open,
     getShell,
@@ -3492,6 +3505,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     close,
     closeIdle,
     closeOnSettle,
+    threadHasRunningSessions,
     subscribe,
     subscribeMetadata,
   });

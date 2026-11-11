@@ -283,6 +283,11 @@ const decodeLifecycleOutput = Schema.decodeUnknownEffect(
           error: Schema.optional(Schema.NullOr(Schema.String)),
         }),
       ),
+      warnings: Schema.optional(Schema.Array(Schema.String)),
+      evicted: Schema.optional(
+        Schema.Struct({ checkpoint: Schema.String, discarded: Schema.Array(Schema.String) }),
+      ),
+      restored: Schema.optional(Schema.Struct({ checkpoint: Schema.String })),
     }),
   ),
 );
@@ -299,13 +304,20 @@ const instanceLock = (workspace: NewgitWorkspace) => {
   return lock;
 };
 
+const lifecycleArgs = (verb: "stop" | "evict" | "start", name: string) =>
+  verb === "evict" ? ["stop", name, "--evict", "--json"] : [verb, name, "--json"];
+
 /**
- * `newgit stop|start <name>` for the instance whose workspace is `worktreePath`;
- * a no-op elsewhere. Failures are logged, never raised: settling and turns go on.
- * `stillWanted` is checked under the instance lock, so a stale request is dropped.
+ * `newgit stop|start <name>` (or `stop --evict`) for the instance at `worktreePath`; a no-op
+ * elsewhere. Failures are logged, never raised. `stillWanted` is checked under the instance
+ * lock, so a stale request is dropped. A start may restore an evicted workspace: spawn's time.
  */
 const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
-  function* (verb: "stop" | "start", worktreePath: string, stillWanted: Effect.Effect<boolean>) {
+  function* (
+    verb: "stop" | "evict" | "start",
+    worktreePath: string,
+    stillWanted: Effect.Effect<boolean>,
+  ) {
     const workspace = yield* readNewgitWorkspace(worktreePath);
     if (workspace === null) return;
     yield* instanceLock(workspace).withPermits(1)(
@@ -314,16 +326,37 @@ const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
         const { stdout, exitCode } = yield* runNewgit({
           operation: `newgitWorkspaces.${verb}`,
           cwd: workspace.storeRoot,
-          args: [verb, workspace.name, "--json"],
-          timeout: LIFECYCLE_TIMEOUT,
+          args: lifecycleArgs(verb, workspace.name),
+          timeout: verb === "stop" ? LIFECYCLE_TIMEOUT : SPAWN_TIMEOUT,
           reportExitCodes: [1],
         });
-        const { resources } = yield* decodeLifecycleOutput(stdout);
+        const {
+          resources,
+          warnings = [],
+          evicted,
+          restored,
+        } = yield* decodeLifecycleOutput(stdout);
         const failed = resources.filter((resource) => resource.status === "failed");
         if (exitCode !== 0 || failed.length > 0) {
           yield* Effect.logWarning(`newgit ${verb} left some resources behind`, {
             instance: workspace.name,
             resources: failed.map((resource) => `${resource.name}: ${resource.error ?? "failed"}`),
+          });
+        }
+        if (warnings.length > 0) {
+          yield* Effect.logWarning(`newgit ${verb} warned`, { instance: workspace.name, warnings });
+        }
+        if (evicted !== undefined) {
+          yield* Effect.logInfo("newgit evicted a settled thread's workspace", {
+            instance: workspace.name,
+            checkpoint: evicted.checkpoint,
+            discarded: evicted.discarded,
+          });
+        }
+        if (restored !== undefined) {
+          yield* Effect.logInfo("newgit restored an evicted workspace", {
+            instance: workspace.name,
+            checkpoint: restored.checkpoint,
           });
         }
       }),
@@ -343,7 +376,18 @@ export const stopNewgitInstance = (
   stillSettled: Effect.Effect<boolean> = Effect.succeed(true),
 ) => runLifecycle("stop", worktreePath, stillSettled);
 
-/** Bring back what the last `stopNewgitInstance` released; cheap when nothing was. */
+/**
+ * Checkpoint a settled thread's instance and delete its workspace, keeping only the marker
+ * at its path; `startNewgitInstance` brings the workspace back. Ignored files no tracker owns
+ * and no resource rebuilds, such as `target/`, are not kept.
+ */
+export const evictNewgitInstance = (worktreePath: string, stillWanted: Effect.Effect<boolean>) =>
+  runLifecycle("evict", worktreePath, stillWanted);
+
+/**
+ * Bring back what the last `stopNewgitInstance` released, and an evicted workspace first;
+ * cheap when nothing was.
+ */
 export const startNewgitInstance = (worktreePath: string) =>
   runLifecycle("start", worktreePath, Effect.succeed(true));
 
