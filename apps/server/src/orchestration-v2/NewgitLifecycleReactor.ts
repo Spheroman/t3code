@@ -49,7 +49,7 @@ const make = Effect.gen(function* () {
     return withNewgit(
       event.type === "thread.settled"
         ? NewgitWorkspaces.stopNewgitInstance(worktreePath, stillSettled(event))
-        : NewgitWorkspaces.startNewgitInstance(worktreePath),
+        : NewgitWorkspaces.startNewgitInstance(worktreePath).pipe(Effect.asVoid),
     );
   };
 

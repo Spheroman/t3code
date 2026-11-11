@@ -1246,7 +1246,7 @@ effectIt.effect(
 );
 
 // newgit fork patch: an evicted workspace that `newgit start` did not bring back holds only its
-// marker, so the agent must not start there.
+// marker, so the agent must not start there, and the user sees newgit's reason.
 const swapNewgitBin = (value: string | undefined) => {
   const previous = process.env.T3CODE_NEWGIT_BIN;
   if (value === undefined) delete process.env.T3CODE_NEWGIT_BIN;
@@ -1271,7 +1271,10 @@ effectIt.effect(
         `branch = "feature"\nstore_root = "${worktreesDir}"\n`,
       );
       const bin = path.join(worktreesDir, "newgit");
-      yield* fileSystem.writeFileString(bin, "#!/bin/sh\necho 'restore refused' >&2\nexit 2\n");
+      yield* fileSystem.writeFileString(
+        bin,
+        "#!/bin/sh\necho '[newgit] warning: restoring' >&2\necho 'Error: restoring `feature` failed (disk full); the workspace is back to its marker' >&2\nexit 1\n",
+      );
       yield* fileSystem.chmod(bin, 0o755);
       yield* Effect.acquireRelease(
         Effect.sync(() => swapNewgitBin(bin)),
@@ -1294,7 +1297,7 @@ effectIt.effect(
           type: "error",
           title: "Couldn't restore thread workspace",
           failure: {
-            message: `newgit could not restore this thread's workspace at ${worktreePath}. Run \`newgit start\` there to see why.`,
+            message: `newgit could not restore this thread's workspace at ${worktreePath}: restoring \`feature\` failed (disk full); the workspace is back to its marker`,
           },
         },
       ]);

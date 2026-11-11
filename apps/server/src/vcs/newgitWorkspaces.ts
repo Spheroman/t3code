@@ -4,6 +4,7 @@
  * `T3CODE_NEWGIT=0` opts out; `T3CODE_NEWGIT_BIN` names a binary off the server's PATH.
  */
 import { GitCommandError, type NewgitTracker, type NewgitTrackerChoice } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -40,6 +41,7 @@ const decodeSpawnOutput = Schema.decodeUnknownEffect(
   ),
 );
 const isSpawnError = Schema.is(ProcessRunner.ProcessSpawnError);
+const isGitCommandError = Schema.is(GitCommandError);
 
 export interface NewgitWorkspace {
   /** The instance name, which is also its source branch. */
@@ -285,7 +287,12 @@ const decodeLifecycleOutput = Schema.decodeUnknownEffect(
       ),
       warnings: Schema.optional(Schema.Array(Schema.String)),
       evicted: Schema.optional(
-        Schema.Struct({ checkpoint: Schema.String, discarded: Schema.Array(Schema.String) }),
+        Schema.Struct({
+          checkpoint: Schema.String,
+          discarded: Schema.optional(Schema.Array(Schema.Struct({ path: Schema.String }))),
+          not_kept: Schema.optional(Schema.Array(Schema.String)),
+          already: Schema.optional(Schema.Boolean),
+        }),
       ),
       restored: Schema.optional(Schema.Struct({ checkpoint: Schema.String })),
     }),
@@ -307,10 +314,16 @@ const instanceLock = (workspace: NewgitWorkspace) => {
 const lifecycleArgs = (verb: "stop" | "evict" | "start", name: string) =>
   verb === "evict" ? ["stop", name, "--evict", "--json"] : [verb, name, "--json"];
 
+// A command newgit refused exits 1 with no report, and `Error: <why>` after any warnings on stderr.
+const newgitError = (stderr: string) => {
+  const at = stderr.indexOf("Error: ");
+  return (at === -1 ? stderr : stderr.slice(at + "Error: ".length)).trim();
+};
+
 /**
- * `newgit stop|start <name>` (or `stop --evict`) for the instance at `worktreePath`; a no-op
- * elsewhere. Failures are logged, never raised. `stillWanted` is checked under the instance
- * lock, so a stale request is dropped. A start may restore an evicted workspace: spawn's time.
+ * `newgit stop|start <name>` (or `stop --evict`), run from the project root so our cwd is never
+ * in the workspace; a no-op outside one. Never fails: yields why newgit did not, or null.
+ * `stillWanted` is checked under the instance lock. A start may restore a workspace: spawn's time.
  */
 const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
   function* (
@@ -319,17 +332,30 @@ const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
     stillWanted: Effect.Effect<boolean>,
   ) {
     const workspace = yield* readNewgitWorkspace(worktreePath);
-    if (workspace === null) return;
-    yield* instanceLock(workspace).withPermits(1)(
+    if (workspace === null) return null;
+    return yield* instanceLock(workspace).withPermits(1)(
       Effect.gen(function* () {
-        if (!(yield* stillWanted)) return;
-        const { stdout, exitCode } = yield* runNewgit({
+        if (!(yield* stillWanted)) return null;
+        const { stdout, stderr, exitCode } = yield* runNewgit({
           operation: `newgitWorkspaces.${verb}`,
           cwd: workspace.storeRoot,
           args: lifecycleArgs(verb, workspace.name),
           timeout: verb === "stop" ? LIFECYCLE_TIMEOUT : SPAWN_TIMEOUT,
           reportExitCodes: [1],
         });
+        if (exitCode !== 0 && stdout.trim() === "") {
+          const reason = newgitError(stderr) || `newgit ${verb} failed`;
+          // Refusing is how eviction keeps what would not come back; the workspace stays as it was.
+          if (verb === "evict") {
+            yield* Effect.logInfo("newgit kept a settled thread's workspace on disk", {
+              instance: workspace.name,
+              reason,
+            });
+          } else {
+            yield* Effect.logWarning(`newgit ${verb} failed`, { instance: workspace.name, reason });
+          }
+          return reason;
+        }
         const {
           resources,
           warnings = [],
@@ -346,11 +372,12 @@ const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
         if (warnings.length > 0) {
           yield* Effect.logWarning(`newgit ${verb} warned`, { instance: workspace.name, warnings });
         }
-        if (evicted !== undefined) {
+        if (evicted !== undefined && evicted.already !== true) {
           yield* Effect.logInfo("newgit evicted a settled thread's workspace", {
             instance: workspace.name,
             checkpoint: evicted.checkpoint,
-            discarded: evicted.discarded,
+            discarded: (evicted.discarded ?? []).map((discarded) => discarded.path),
+            notKept: evicted.not_kept ?? [],
           });
         }
         if (restored !== undefined) {
@@ -359,13 +386,22 @@ const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
             checkpoint: restored.checkpoint,
           });
         }
+        return null;
       }),
     );
   },
   (effect, verb, worktreePath) =>
     effect.pipe(
       Effect.catchCause((cause) =>
-        Effect.logWarning(`newgit ${verb} failed`, { worktreePath, cause }),
+        Effect.logWarning(`newgit ${verb} failed`, { worktreePath, cause }).pipe(
+          Effect.as(
+            Option.match(Cause.findErrorOption(cause), {
+              onNone: () => `newgit ${verb} failed`,
+              onSome: (error) =>
+                isGitCommandError(error) ? error.detail : `newgit ${verb} failed`,
+            }),
+          ),
+        ),
       ),
     ),
 );
@@ -374,19 +410,19 @@ const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
 export const stopNewgitInstance = (
   worktreePath: string,
   stillSettled: Effect.Effect<boolean> = Effect.succeed(true),
-) => runLifecycle("stop", worktreePath, stillSettled);
+) => runLifecycle("stop", worktreePath, stillSettled).pipe(Effect.asVoid);
 
 /**
- * Checkpoint a settled thread's instance and delete its workspace, keeping only the marker
- * at its path; `startNewgitInstance` brings the workspace back. Ignored files no tracker owns
- * and no resource rebuilds, such as `target/`, are not kept.
+ * Checkpoint a settled thread's instance and delete its workspace but its marker. newgit refuses,
+ * deleting nothing, when something would not come back; that is logged and the workspace stays.
+ * Never `--discard-ignored`: projects declare disposable build output as a newgit resource.
  */
 export const evictNewgitInstance = (worktreePath: string, stillWanted: Effect.Effect<boolean>) =>
-  runLifecycle("evict", worktreePath, stillWanted);
+  runLifecycle("evict", worktreePath, stillWanted).pipe(Effect.asVoid);
 
 /**
  * Bring back what the last `stopNewgitInstance` released, and an evicted workspace first;
- * cheap when nothing was.
+ * cheap when nothing was. Yields newgit's reason when it could not, or null.
  */
 export const startNewgitInstance = (worktreePath: string) =>
   runLifecycle("start", worktreePath, Effect.succeed(true));

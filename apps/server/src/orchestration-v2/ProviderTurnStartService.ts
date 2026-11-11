@@ -89,9 +89,12 @@ class WorktreeRecreateError extends Schema.TaggedError<WorktreeRecreateError>()(
 // newgit fork patch: `newgit start` could not bring back a settled thread's evicted workspace.
 class NewgitRestoreError extends Schema.TaggedError<NewgitRestoreError>()("NewgitRestoreError", {
   worktreePath: Schema.String,
+  reason: Schema.NullOr(Schema.String),
 }) {
   override get message(): string {
-    return `newgit could not restore this thread's workspace at ${this.worktreePath}. Run \`newgit start\` there to see why.`;
+    return this.reason === null
+      ? `newgit could not restore this thread's workspace at ${this.worktreePath}. Run \`newgit start\` there to see why.`
+      : `newgit could not restore this thread's workspace at ${this.worktreePath}: ${this.reason}`;
   }
 }
 
@@ -696,10 +699,15 @@ export const layer: Layer.Layer<
           path,
           spawner: newgitSpawner.value,
         });
-        yield* NewgitWorkspaces.startNewgitInstance(worktreePath).pipe(withNewgit);
-        // An evicted workspace that did not come back holds only its marker: don't run the agent there.
-        if (yield* NewgitWorkspaces.isEvictedNewgitWorkspace(worktreePath).pipe(withNewgit)) {
-          const error = new NewgitRestoreError({ worktreePath });
+        const wasEvicted =
+          yield* NewgitWorkspaces.isEvictedNewgitWorkspace(worktreePath).pipe(withNewgit);
+        const startFailure =
+          yield* NewgitWorkspaces.startNewgitInstance(worktreePath).pipe(withNewgit);
+        // A failed restore leaves the marker, or what it found moved aside: don't run the agent there.
+        const stillEvicted =
+          yield* NewgitWorkspaces.isEvictedNewgitWorkspace(worktreePath).pipe(withNewgit);
+        if (stillEvicted || (wasEvicted && startFailure !== null)) {
+          const error = new NewgitRestoreError({ worktreePath, reason: startFailure });
           if (input.willRetry === true) return yield* error;
           yield* settleStartFailure({
             signal: "newgit-restore-failure",
