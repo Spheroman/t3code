@@ -1792,7 +1792,7 @@ export function ThreadsSettingsPanel() {
               serverScoped
               settingKeys={["newgitEvictSettledWorkspaces"]}
               {...searchableSetting("newgit-evict-settled-workspaces")}
-              description="In newgit projects, settling a thread saves a checkpoint and deletes its workspace. Un-settling or messaging the thread brings it back. Ignored build output such as target/ is not kept."
+              description="On by default. In newgit projects, settling a thread saves a checkpoint and deletes its workspace. Un-settling or messaging the thread brings it back. Ignored build output such as target/ is not kept."
               control={
                 <ScopedSwitch
                   settingKeys={["newgitEvictSettledWorkspaces"]}

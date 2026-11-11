@@ -391,6 +391,18 @@ export const evictNewgitInstance = (worktreePath: string, stillWanted: Effect.Ef
 export const startNewgitInstance = (worktreePath: string) =>
   runLifecycle("start", worktreePath, Effect.succeed(true));
 
+/** Whether `worktreePath` is a newgit workspace that is still evicted: its marker, but no clone. */
+export const isEvictedNewgitWorkspace = Effect.fn("newgitWorkspaces.isEvictedNewgitWorkspace")(
+  function* (worktreePath: string) {
+    if ((yield* readNewgitWorkspace(worktreePath)) === null) return false;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    return !(yield* fileSystem
+      .exists(path.join(worktreePath, ".git"))
+      .pipe(Effect.orElseSucceed(() => true)));
+  },
+);
+
 /** Provide what this module needs from services a caller already holds. */
 export const provideNewgitServices =
   (services: {

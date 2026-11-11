@@ -86,6 +86,15 @@ class WorktreeRecreateError extends Schema.TaggedError<WorktreeRecreateError>()(
   }
 }
 
+// newgit fork patch: `newgit start` could not bring back a settled thread's evicted workspace.
+class NewgitRestoreError extends Schema.TaggedError<NewgitRestoreError>()("NewgitRestoreError", {
+  worktreePath: Schema.String,
+}) {
+  override get message(): string {
+    return `newgit could not restore this thread's workspace at ${this.worktreePath}. Run \`newgit start\` there to see why.`;
+  }
+}
+
 class WorktreeRecreateNoBaseError extends Schema.TaggedError<WorktreeRecreateNoBaseError>()(
   "WorktreeRecreateNoBaseError",
   { worktreePath: Schema.String, branch: Schema.String },
@@ -682,13 +691,23 @@ export const layer: Layer.Layer<
       }
       // newgit fork patch: the agent's first command must not hit a dev server settling stopped.
       if (worktreePath !== null && Option.isSome(newgitSpawner)) {
-        yield* NewgitWorkspaces.startNewgitInstance(worktreePath).pipe(
-          NewgitWorkspaces.provideNewgitServices({
-            fileSystem,
-            path,
-            spawner: newgitSpawner.value,
-          }),
-        );
+        const withNewgit = NewgitWorkspaces.provideNewgitServices({
+          fileSystem,
+          path,
+          spawner: newgitSpawner.value,
+        });
+        yield* NewgitWorkspaces.startNewgitInstance(worktreePath).pipe(withNewgit);
+        // An evicted workspace that did not come back holds only its marker: don't run the agent there.
+        if (yield* NewgitWorkspaces.isEvictedNewgitWorkspace(worktreePath).pipe(withNewgit)) {
+          const error = new NewgitRestoreError({ worktreePath });
+          if (input.willRetry === true) return yield* error;
+          yield* settleStartFailure({
+            signal: "newgit-restore-failure",
+            title: "Couldn't restore thread workspace",
+            error,
+          });
+          return;
+        }
       }
       const selectInheritedBackgroundItems = (
         current: ProjectionStore.ProjectionRuntimeRecoveryState,

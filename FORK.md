@@ -14,15 +14,17 @@ worktree strategy, `delegate_task` (with `isolation: "worktree"`), and
 `t3_worktree_handoff`; `t3 thread start --worktree <base>` takes `--use` and
 `--drop`. A choice that would land in a plain Git worktree is refused.
 Settling the thread runs `newgit stop`, which releases its running
-resources at once. Once the thread's settle action is done, and only if no
-terminal still runs a command there, it also runs `newgit stop --evict`.
-That checkpoints the instance and deletes the workspace, leaving its
-marker. Ignored files that no tracker owns and no resource rebuilds, such
-as `target/`, are not kept. Unsettling the thread runs `newgit start`, and
-so does every turn before the agent starts. `start` first brings an
-evicted workspace back from its checkpoint, at the same path. Turn off
-**Free disk when a newgit thread settles** in Settings → Threads to keep
-settled workspaces on disk. Deleting the thread runs `newgit remove`. A new
+resources at once. Once the thread's settle action is done, it also runs
+`newgit stop --evict`, but only if that thread and every unarchived thread
+sharing its workspace, such as a delegated child, are settled and run no
+terminal. That checkpoints the instance and deletes the workspace, leaving
+its marker. Ignored files that no tracker owns and no resource rebuilds,
+such as `target/`, are not kept. Unsettling the thread runs `newgit start`,
+and so does every turn before the agent starts. `start` first brings an
+evicted workspace back from its checkpoint, at the same path; if it can't,
+the turn fails before the agent starts, rather than running it in an empty
+folder. Eviction is on by default: turn off **Free disk when a newgit
+thread settles** in Settings → Threads to keep settled workspaces on disk. Deleting the thread runs `newgit remove`. A new
 thread that starts from origin waits up to five minutes for its base
 branch to fetch, instead of 30 seconds, since a newgit remote can be slow. Every other project gets plain worktrees, as upstream does.
 

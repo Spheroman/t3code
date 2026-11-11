@@ -300,6 +300,46 @@ export function autoSettlementSettingsKey(
   ]);
 }
 
+/**
+ * newgit fork patch: whether a settled thread's newgit workspace may be evicted. It and every
+ * unarchived thread sharing the workspace, such as a delegated child, must be settled with no
+ * terminal running. An archived thread's next turn restores the workspace, as any turn does.
+ */
+export const newgitWorkspaceIdle = (
+  projections: Pick<
+    ProjectionStore.ProjectionStoreV2["Service"],
+    "getThread" | "getThreadWorktreePaths"
+  >,
+  terminals: Pick<TerminalManager.TerminalManager["Service"], "threadHasRunningSessions">,
+  threadId: ThreadId,
+  worktreePath: string,
+): Effect.Effect<boolean> =>
+  projections.getThreadWorktreePaths().pipe(
+    Effect.map((rows) => [
+      threadId,
+      ...rows
+        .filter((row) => row.worktreePath === worktreePath && row.threadId !== threadId)
+        .map((row) => row.threadId),
+    ]),
+    Effect.flatMap((threadIds) =>
+      Effect.forEach(threadIds, (id) =>
+        projections
+          .getThread(id)
+          .pipe(
+            Effect.flatMap((thread) =>
+              thread.settledOverride === "settled"
+                ? terminals
+                    .threadHasRunningSessions({ threadId: id })
+                    .pipe(Effect.map((running) => !running))
+                : Effect.succeed(false),
+            ),
+          ),
+      ),
+    ),
+    Effect.map((idle) => idle.every(Boolean)),
+    Effect.orElseSucceed(() => false),
+  );
+
 export const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -324,15 +364,8 @@ export const make = Effect.gen(function* () {
   ) {
     if (Option.isNone(newgitSpawner)) return;
     if (!(yield* settingsService.getSettings).newgitEvictSettledWorkspaces) return;
-    // Checked under the instance lock: unsettled since, or a terminal still running there.
-    const stillWanted = projections.getThread(threadId).pipe(
-      Effect.flatMap((thread) =>
-        thread.settledOverride === "settled"
-          ? terminals.threadHasRunningSessions({ threadId }).pipe(Effect.map((running) => !running))
-          : Effect.succeed(false),
-      ),
-      Effect.orElseSucceed(() => false),
-    );
+    // Checked under the instance lock, so a thread unsettled in the meantime keeps its workspace.
+    const stillWanted = newgitWorkspaceIdle(projections, terminals, threadId, worktreePath);
     yield* NewgitWorkspaces.evictNewgitInstance(worktreePath, stillWanted).pipe(
       NewgitWorkspaces.provideNewgitServices({ fileSystem, path, spawner: newgitSpawner.value }),
     );
