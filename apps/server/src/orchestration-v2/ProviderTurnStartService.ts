@@ -569,7 +569,7 @@ export const layer: Layer.Layer<
         },
       );
       // newgit fork patch: what `newgit start` warned, such as saved copies a failed restore left,
-      // shown once per thread: a later start repeats the same warnings until they are dealt with.
+      // and why the instance is not ready, shown once each: a later start repeats them unchanged.
       const noteNewgitWarnings = Effect.fn("ProviderTurnStartService.noteNewgitWarnings")(
         function* (warnings: ReadonlyArray<string>) {
           const text = warnings.join("\n");
@@ -765,15 +765,34 @@ export const layer: Layer.Layer<
         });
         const wasEvicted =
           yield* NewgitWorkspaces.isEvictedNewgitWorkspace(worktreePath).pipe(withNewgit);
+        const worktreeExists = fileSystem
+          .exists(worktreePath)
+          .pipe(Effect.orElseSucceed(() => true));
+        // Deleted by hand, marker and all: the thread's branch is its instance, which newgit rebuilds.
+        const project =
+          branch !== null && !(yield* worktreeExists)
+            ? yield* projects.getById(projection.thread.projectId).pipe(
+                Effect.map(Option.getOrUndefined),
+                Effect.orElseSucceed(() => undefined),
+              )
+            : undefined;
+        const missing =
+          branch !== null &&
+          project !== undefined &&
+          (yield* NewgitWorkspaces.projectUsesNewgit(project.workspaceRoot).pipe(withNewgit))
+            ? { name: branch, storeRoot: project.workspaceRoot }
+            : undefined;
         // Only a message the user sent may retry a restore that already failed.
         const userActed = message.createdBy === "user" && message.creationSource !== "server";
         const started = yield* NewgitWorkspaces.startNewgitInstance(worktreePath, {
           userActedAt: userActed ? DateTime.toEpochMillis(run.requestedAt) : undefined,
+          missing,
         }).pipe(withNewgit);
         // A failed restore leaves the marker, or what it found moved aside: don't run the agent there.
         const stillEvicted =
           yield* NewgitWorkspaces.isEvictedNewgitWorkspace(worktreePath).pipe(withNewgit);
-        if (stillEvicted || (wasEvicted && started.failure !== null)) {
+        const stillMissing = missing !== undefined && !(yield* worktreeExists);
+        if (stillEvicted || stillMissing || (wasEvicted && started.failure !== null)) {
           // Not retried: a retry would not run `newgit start` again.
           yield* settleStartFailure({
             signal: "newgit-restore-failure",
@@ -782,8 +801,9 @@ export const layer: Layer.Layer<
           });
           return;
         }
-        if (started.warnings.length > 0) {
-          yield* noteNewgitWarnings(started.warnings);
+        // Not ready is not a failure: the workspace is usable, and the agent may be the fix.
+        if (started.problems.length > 0 || started.warnings.length > 0) {
+          yield* noteNewgitWarnings([...started.problems, ...started.warnings]);
         }
       }
       const selectInheritedBackgroundItems = (

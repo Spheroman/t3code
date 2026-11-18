@@ -1329,56 +1329,61 @@ effectIt.effect(
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
 );
 
-effectIt.effect("shows what a successful `newgit start` warned once per thread", () =>
-  Effect.gen(function* () {
-    const fileSystem = yield* FileSystem.FileSystem;
-    const path = yield* Path.Path;
-    const worktreesDir = yield* fileSystem.makeTempDirectoryScoped({
-      prefix: "t3-newgit-warned-",
-    });
-    const worktreePath = path.join(worktreesDir, "project", "restore");
-    yield* fileSystem.makeDirectory(path.join(worktreePath, ".git"), { recursive: true });
-    yield* fileSystem.makeDirectory(path.join(worktreePath, ".newgit", "local"), {
-      recursive: true,
-    });
-    yield* fileSystem.writeFileString(
-      path.join(worktreePath, ".newgit", "local", "instance.toml"),
-      `branch = "feature"\nstore_root = "${worktreesDir}"\n`,
-    );
-    const warnings = [
-      "a saved copy of the path is at .restore.restore-failed; no checkpoint holds it",
-      "discard it with `newgit cleanup --discard-saved .restore.restore-failed`",
-    ];
-    const bin = path.join(worktreesDir, "newgit");
-    yield* fileSystem.writeFileString(
-      bin,
-      `#!/bin/sh\necho '${JSON.stringify({ resources: [], warnings })}'\n`,
-    );
-    yield* fileSystem.chmod(bin, 0o755);
-    yield* Effect.acquireRelease(
-      Effect.sync(() => swapNewgitBin(bin)),
-      (previous) => Effect.sync(() => swapNewgitBin(previous)),
-    );
-    const notices = (previousNotices?: ReadonlyArray<string>) =>
-      Effect.gen(function* () {
-        const harness = makeLocalCommandHarness({
-          text: "Continue",
-          worktreesDir,
-          worktreePath,
-          fileSystem,
-          previousTurn: { runStatus: "completed", turnStatus: "completed" },
-          ...(previousNotices === undefined ? {} : { previousNotices }),
-        });
-        yield* harness.start;
-        expect(harness.startRootRun).toHaveBeenCalledOnce();
-        return harness
-          .projection()
-          .turnItems.flatMap((item) => (item.type === "system_notice" ? [item.message] : []));
+effectIt.effect(
+  "runs the turn and shows once what `newgit start` warned and why it is not ready",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const worktreesDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-newgit-warned-",
       });
+      const worktreePath = path.join(worktreesDir, "project", "restore");
+      yield* fileSystem.makeDirectory(path.join(worktreePath, ".git"), { recursive: true });
+      yield* fileSystem.makeDirectory(path.join(worktreePath, ".newgit", "local"), {
+        recursive: true,
+      });
+      yield* fileSystem.writeFileString(
+        path.join(worktreePath, ".newgit", "local", "instance.toml"),
+        `branch = "feature"\nstore_root = "${worktreesDir}"\n`,
+      );
+      const warnings = [
+        "a saved copy of the path is at .restore.restore-failed; no checkpoint holds it",
+        "discard it with `newgit cleanup --discard-saved .restore.restore-failed`",
+      ];
+      const notUp = "`db` is not up after 30s (`pg_isready` exited 2); its log is /l/db.log";
+      const bin = path.join(worktreesDir, "newgit");
+      // Exit 1 with a report: started, not ready, and the workspace usable.
+      yield* fileSystem.writeFileString(
+        bin,
+        `#!/bin/sh\necho '${JSON.stringify({ resources: [], warnings, problems: [notUp] })}'\nexit 1\n`,
+      );
+      yield* fileSystem.chmod(bin, 0o755);
+      yield* Effect.acquireRelease(
+        Effect.sync(() => swapNewgitBin(bin)),
+        (previous) => Effect.sync(() => swapNewgitBin(previous)),
+      );
+      const notices = (previousNotices?: ReadonlyArray<string>) =>
+        Effect.gen(function* () {
+          const harness = makeLocalCommandHarness({
+            text: "Continue",
+            worktreesDir,
+            worktreePath,
+            fileSystem,
+            previousTurn: { runStatus: "completed", turnStatus: "completed" },
+            ...(previousNotices === undefined ? {} : { previousNotices }),
+          });
+          yield* harness.start;
+          expect(harness.startRootRun).toHaveBeenCalledOnce();
+          return harness
+            .projection()
+            .turnItems.flatMap((item) => (item.type === "system_notice" ? [item.message] : []));
+        });
 
-    expect(yield* notices()).toEqual([warnings.join("\n")]);
-    expect(yield* notices([warnings.join("\n")])).toEqual([warnings.join("\n")]);
-  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+      const notice = [notUp, ...warnings].join("\n");
+      expect(yield* notices()).toEqual([notice]);
+      expect(yield* notices([notice])).toEqual([notice]);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
 );
 
 effectIt.effect("recovers an abandoned failed turn before continuing its native conversation", () =>

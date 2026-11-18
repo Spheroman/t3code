@@ -4869,7 +4869,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     // newgit fork patch: newgit owns its workspaces' removal.
     const newgitWorkspace = yield* withNewgit(NewgitWorkspaces.readNewgitWorkspace(target));
     if (newgitWorkspace !== null) {
-      return yield* withNewgit(NewgitWorkspaces.removeNewgitWorkspace(newgitWorkspace));
+      return yield* withNewgit(
+        NewgitWorkspaces.removeNewgitWorkspace(newgitWorkspace, target, {
+          force: input.newgitForce === true,
+        }),
+      );
     }
     const result = yield* removeLinkedWorktree({
       operation: "GitVcsDriver.removeWorktree",

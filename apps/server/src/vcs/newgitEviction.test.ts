@@ -162,6 +162,7 @@ describe("newgit eviction", () => {
       assert.deepEqual(yield* startNewgitInstance(started.dir), {
         failure: null,
         warnings: ["saved copy at /w/.feature.restore-failed"],
+        problems: [],
       });
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
@@ -169,7 +170,7 @@ describe("newgit eviction", () => {
   it.effect("runs no `newgit start` after a failed restore until the user acts again", () =>
     Effect.gen(function* () {
       const workspace = yield* setup("echo 'Error: restoring `feature` failed' >&2\nexit 1");
-      const failed = { failure: "restoring `feature` failed", warnings: [] };
+      const failed = { failure: "restoring `feature` failed", warnings: [], problems: [] };
       assert.deepEqual(yield* startNewgitInstance(workspace.dir), failed);
       // Automatic starts (unsettling, a retry), and a message sent before the failure, wait.
       assert.deepEqual(yield* startNewgitInstance(workspace.dir), failed);
