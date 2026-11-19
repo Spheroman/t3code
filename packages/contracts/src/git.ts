@@ -190,6 +190,8 @@ export const VcsRemoveWorktreeInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
   path: TrimmedNonEmptyStringSchema,
   force: Schema.optional(Schema.Boolean),
+  // newgit fork patch: `newgit remove --force`, deleting what a refused removal kept.
+  newgitForce: Schema.optional(Schema.Boolean),
 });
 export type VcsRemoveWorktreeInput = typeof VcsRemoveWorktreeInput.Type;
 
@@ -407,6 +409,8 @@ export const GitCommandFailureReason = Schema.Literals([
   "ref_not_found",
   "remote_unreachable",
   "tag_would_be_clobbered",
+  // newgit fork patch: `newgit remove` refused, deleting nothing, to keep what no checkpoint holds.
+  "newgit_remove_refused",
 ]);
 export type GitCommandFailureReason = typeof GitCommandFailureReason.Type;
 

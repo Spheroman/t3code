@@ -38,6 +38,7 @@ const decodeSpawnOutput = Schema.decodeUnknownEffect(
     Schema.Struct({
       workspace: Schema.NonEmptyString,
       resources: Schema.optional(Schema.Array(SpawnResource)),
+      problems: Schema.optional(Schema.Array(Schema.String)),
     }),
   ),
 );
@@ -92,6 +93,11 @@ export const readNewgitWorkspace = Effect.fn("newgitWorkspaces.readNewgitWorkspa
       Effect.map(parseMarker),
       Effect.orElseSucceed(() => null),
     );
+});
+
+const pathExists = Effect.fn("newgitWorkspaces.pathExists")(function* (target: string) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  return yield* fileSystem.exists(target).pipe(Effect.orElseSucceed(() => true));
 });
 
 interface NewgitOutput {
@@ -212,7 +218,8 @@ const trackerArgs = (choice: NewgitTrackerChoice | undefined) => [
 /**
  * `newgit spawn <name> --from <ref>` in the project at `cwd`. Returns the workspace
  * path, or None when newgit can't run so the caller falls back to a git worktree.
- * Exit 1 with a report means a resource didn't come up: open the workspace anyway.
+ * Exit 1 with a report means the instance exists but is not ready: open the workspace
+ * anyway. The first turn's `newgit start` reports the same problems to the thread.
  */
 export const spawnNewgitWorkspace = Effect.fn("newgitWorkspaces.spawnNewgitWorkspace")(
   function* (input: {
@@ -240,7 +247,11 @@ export const spawnNewgitWorkspace = Effect.fn("newgitWorkspaces.spawnNewgitWorks
     );
     if (Option.isNone(output)) return Option.none<string>();
     const { stdout, stderr, exitCode } = output.value;
-    const { workspace, resources = [] } = yield* decodeSpawnOutput(stdout).pipe(
+    const {
+      workspace,
+      resources = [],
+      problems = [],
+    } = yield* decodeSpawnOutput(stdout).pipe(
       Effect.mapError(
         (cause) =>
           new GitCommandError({
@@ -257,24 +268,16 @@ export const spawnNewgitWorkspace = Effect.fn("newgitWorkspaces.spawnNewgitWorks
       ),
     );
     const notReady = resources.filter((resource) => resource.status !== "ready");
-    if (exitCode !== 0 || notReady.length > 0) {
-      yield* Effect.logWarning("newgit spawned the workspace, but some resources are not ready", {
+    if (exitCode !== 0 || notReady.length > 0 || problems.length > 0) {
+      yield* Effect.logWarning("newgit spawned the workspace, but it is not ready", {
         workspace,
+        problems,
         resources: notReady.map(describeResource),
       });
     }
     return Option.some(workspace);
   },
 );
-
-/** `newgit remove <name>`, run from the instance's project root. */
-export const removeNewgitWorkspace = (workspace: NewgitWorkspace) =>
-  runNewgit({
-    operation: "newgitWorkspaces.remove",
-    cwd: workspace.storeRoot,
-    args: ["remove", workspace.name],
-    timeout: REMOVE_TIMEOUT,
-  }).pipe(Effect.asVoid);
 
 const decodeLifecycleOutput = Schema.decodeUnknownEffect(
   Schema.fromJsonString(
@@ -296,6 +299,8 @@ const decodeLifecycleOutput = Schema.decodeUnknownEffect(
         }),
       ),
       restored: Schema.optional(Schema.Struct({ checkpoint: Schema.String })),
+      rebuilt: Schema.optional(Schema.Struct({ checkpoint: Schema.NullOr(Schema.String) })),
+      problems: Schema.optional(Schema.Array(Schema.String)),
     }),
   ),
 );
@@ -358,10 +363,17 @@ interface LifecycleOutcome {
   readonly failure: string | null;
   /** What a successful run warned, such as saved copies a failed restore left. */
   readonly warnings: ReadonlyArray<string>;
+  /** Why a start that ran left the instance not ready: a `[ready]` check, a port, a definition. */
+  readonly problems: ReadonlyArray<string>;
 }
-const succeeded = (warnings: ReadonlyArray<string> = []): LifecycleOutcome => ({
-  failure: null,
-  warnings,
+const succeeded = (
+  warnings: ReadonlyArray<string> = [],
+  problems: ReadonlyArray<string> = [],
+): LifecycleOutcome => ({ failure: null, warnings, problems });
+const failedWith = (reason: string): LifecycleOutcome => ({
+  failure: reason,
+  warnings: [],
+  problems: [],
 });
 
 /**
@@ -371,10 +383,10 @@ const succeeded = (warnings: ReadonlyArray<string> = []): LifecycleOutcome => ({
 const restoreFailures = new Map<string, { readonly reason: string; readonly atMs: number }>();
 
 /**
- * `newgit stop|start <name>` (or `stop --evict`), run from the project root so our cwd is never
- * in the workspace; a no-op outside one. Never fails. `stillWanted` is checked under the instance
- * lock. A start may restore a workspace: spawn's time. A start with a restore failed since
- * `userActedAt` (always, when absent) does not run and yields that failure.
+ * `newgit stop|start <name>` (or `stop --evict`) from the project root, never in the workspace;
+ * a no-op outside one, or for `missing` once its directory is gone. Never fails. `stillWanted` is
+ * checked under the instance lock. A start with a restore failed since `userActedAt` (always,
+ * when absent) does not run and yields that failure.
  */
 const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
   function* (
@@ -382,9 +394,17 @@ const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
     worktreePath: string,
     stillWanted: Effect.Effect<boolean>,
     userActedAt?: number,
+    missing?: NewgitWorkspace,
   ) {
-    const workspace = yield* readNewgitWorkspace(worktreePath);
-    if (workspace === null) return succeeded();
+    const marked = yield* readNewgitWorkspace(worktreePath);
+    const rebuilding =
+      marked === null &&
+      verb === "start" &&
+      missing !== undefined &&
+      enabled() &&
+      !(yield* pathExists(worktreePath));
+    const workspace = marked ?? (rebuilding ? missing : null);
+    if (workspace === null || workspace === undefined) return succeeded();
     const key = instanceKey(workspace);
     return yield* instanceLock(workspace).withPermits(1)(
       Effect.gen(function* () {
@@ -394,11 +414,11 @@ const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
           const failed = restoreFailures.get(key);
           if (failed !== undefined) {
             if (userActedAt === undefined || userActedAt <= failed.atMs) {
-              return { failure: failed.reason, warnings: [] } satisfies LifecycleOutcome;
+              return failedWith(failed.reason);
             }
             restoreFailures.delete(key);
           }
-          restoring = yield* isEvictedNewgitWorkspace(worktreePath);
+          restoring = rebuilding || (yield* isEvictedNewgitWorkspace(worktreePath));
         }
         const { stdout, stderr, exitCode } = yield* runNewgit({
           operation: `newgitWorkspaces.${verb}`,
@@ -421,20 +441,28 @@ const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
           if (restoring) {
             restoreFailures.set(key, { reason, atMs: yield* Clock.currentTimeMillis });
           }
-          return { failure: reason, warnings: [] } satisfies LifecycleOutcome;
+          return failedWith(reason);
         }
         const {
           resources,
           warnings = [],
           evicted,
           restored,
+          rebuilt,
+          problems: notReady = [],
         } = yield* decodeLifecycleOutput(stdout);
-        const failed = resources.filter((resource) => resource.status === "failed");
-        if (exitCode !== 0 || failed.length > 0) {
-          yield* Effect.logWarning(`newgit ${verb} left some resources behind`, {
-            instance: workspace.name,
-            resources: failed.map((resource) => `${resource.name}: ${resource.error ?? "failed"}`),
-          });
+        const failed = resources
+          .filter((resource) => resource.status === "failed")
+          .map((resource) => `${resource.name}: ${resource.error ?? "failed"}`);
+        // Exit 1 with a report: a start that ran, leaving the instance not ready, still usable.
+        const problems = [...new Set([...failed, ...notReady])];
+        if (exitCode !== 0 || problems.length > 0) {
+          yield* Effect.logWarning(
+            verb === "start"
+              ? "newgit started the instance, but it is not ready"
+              : `newgit ${verb} left some resources behind`,
+            { instance: workspace.name, problems },
+          );
         }
         if (warnings.length > 0) {
           yield* Effect.logWarning(`newgit ${verb} warned`, { instance: workspace.name, warnings });
@@ -453,7 +481,13 @@ const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
             checkpoint: restored.checkpoint,
           });
         }
-        return succeeded(warnings);
+        if (rebuilt !== undefined) {
+          yield* Effect.logInfo("newgit rebuilt a workspace deleted by hand", {
+            instance: workspace.name,
+            checkpoint: rebuilt.checkpoint,
+          });
+        }
+        return succeeded(warnings, verb === "start" ? problems : []);
       }),
     );
   },
@@ -461,14 +495,15 @@ const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
     effect.pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning(`newgit ${verb} failed`, { worktreePath, cause }).pipe(
-          Effect.as<LifecycleOutcome>({
-            failure: Option.match(Cause.findErrorOption(cause), {
-              onNone: () => `newgit ${verb} failed`,
-              onSome: (error) =>
-                isGitCommandError(error) ? error.detail : `newgit ${verb} failed`,
-            }),
-            warnings: [],
-          }),
+          Effect.as<LifecycleOutcome>(
+            failedWith(
+              Option.match(Cause.findErrorOption(cause), {
+                onNone: () => `newgit ${verb} failed`,
+                onSome: (error) =>
+                  isGitCommandError(error) ? error.detail : `newgit ${verb} failed`,
+              }),
+            ),
+          ),
         ),
       ),
     ),
@@ -489,15 +524,75 @@ export const evictNewgitInstance = (worktreePath: string, stillWanted: Effect.Ef
   runLifecycle("evict", worktreePath, stillWanted).pipe(Effect.asVoid);
 
 /**
- * Bring back what the last `stopNewgitInstance` released, and an evicted workspace first;
- * cheap when nothing was. Yields why newgit could not, and what it warned when it could.
- * Once a restore fails, no start runs for that workspace again until one passes a
- * `userActedAt` (epoch ms) later than the failure: a message the user sent after it.
+ * Bring back what the last stop released, rebuilding an evicted or deleted workspace first.
+ * Yields why newgit could not, its warnings, and why the instance is not ready. After a failed
+ * restore, only a `userActedAt` (epoch ms) later than it runs one again. `missing` is the
+ * instance whose workspace this was, for when its directory, marker and all, is gone.
  */
 export const startNewgitInstance = (
   worktreePath: string,
-  options: { readonly userActedAt?: number | undefined } = {},
-) => runLifecycle("start", worktreePath, Effect.succeed(true), options.userActedAt);
+  options: {
+    readonly userActedAt?: number | undefined;
+    readonly missing?: NewgitWorkspace | undefined;
+  } = {},
+) =>
+  runLifecycle("start", worktreePath, Effect.succeed(true), options.userActedAt, options.missing);
+
+/**
+ * `newgit remove <name>`. newgit refuses, deleting nothing, when that would lose what no
+ * checkpoint holds, most often a stopped database it cannot dump, so a refused removal starts
+ * the instance and tries again. A second refusal is `newgit_remove_refused`, the instance left
+ * as it was; `force` is the user deleting anyway.
+ */
+export const removeNewgitWorkspace = Effect.fn("newgitWorkspaces.removeNewgitWorkspace")(function* (
+  workspace: NewgitWorkspace,
+  worktreePath: string,
+  options: { readonly force?: boolean } = {},
+) {
+  const run = (verb: "remove" | "start" | "stop") =>
+    runNewgit({
+      operation: `newgitWorkspaces.${verb}`,
+      cwd: workspace.storeRoot,
+      // `remove` without `--json`: only its exit and refusal are read, so an older newgit works.
+      args:
+        verb === "remove"
+          ? [verb, workspace.name, ...(options.force === true ? ["--force"] : [])]
+          : [verb, workspace.name, "--json"],
+      timeout: verb === "start" ? SPAWN_TIMEOUT : REMOVE_TIMEOUT,
+      reportExitCodes: [1],
+    });
+  const refused = (output: NewgitOutput) =>
+    new GitCommandError({
+      operation: "newgitWorkspaces.remove",
+      command: "newgit remove",
+      cwd: workspace.storeRoot,
+      detail: newgitError(output.stderr) || "newgit remove failed",
+      exitCode: output.exitCode,
+      reason: "newgit_remove_refused",
+    });
+  yield* instanceLock(workspace).withPermits(1)(
+    Effect.gen(function* () {
+      const first = yield* run("remove");
+      if (first.exitCode === 0) return;
+      // An evicted instance's removal captures nothing, so starting it would not help.
+      if (options.force === true || (yield* isEvictedNewgitWorkspace(worktreePath))) {
+        return yield* refused(first);
+      }
+      // Only what `start` brought back can change what the removal captures.
+      const brought = yield* run("start").pipe(
+        Effect.flatMap((output) => decodeLifecycleOutput(output.stdout)),
+        Effect.map(({ resources }) => resources.some(({ status }) => status === "started")),
+        Effect.orElseSucceed(() => false),
+      );
+      if (!brought) return yield* refused(first);
+      const second = yield* run("remove");
+      if (second.exitCode === 0) return;
+      // Kept, as it was before the delete: a settled thread's resources stay stopped.
+      yield* run("stop").pipe(Effect.ignoreCause({ log: true }));
+      return yield* refused(second);
+    }),
+  );
+});
 
 /** Whether `worktreePath` is a newgit workspace that is still evicted: its marker, but no clone. */
 export const isEvictedNewgitWorkspace = Effect.fn("newgitWorkspaces.isEvictedNewgitWorkspace")(

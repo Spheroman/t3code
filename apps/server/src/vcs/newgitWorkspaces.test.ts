@@ -131,26 +131,57 @@ describe("newgit workspaces", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("logs resources that failed to start instead of failing", () =>
+  it.effect("yields why a start left the instance not ready, instead of failing", () =>
     Effect.gen(function* () {
       const workspace = yield* fakeWorkspace("feature");
+      const notUp = "`db` is not up after 30s (`pg_isready` exited 2); its log is /l/db.log";
       const report = JSON.stringify({
         instance: "feature",
         resources: [
           { name: "web", action: "dev", status: "failed", error: "port 3000 in use" },
           { name: "db", action: "serve", status: "started" },
         ],
+        starting: [],
+        problems: [notUp],
       });
       yield* fakeNewgit(`echo '${report}'; exit 1`);
       const logs: string[] = [];
-      yield* startNewgitInstance(workspace.dir).pipe(
+      const started = yield* startNewgitInstance(workspace.dir).pipe(
         Effect.provide(
           Logger.layer([Logger.make(({ message }) => logs.push(JSON.stringify(message)))]),
         ),
       );
-      const warning = logs.find((line) => line.includes("left some resources")) ?? "";
-      assert.include(warning, "web: port 3000 in use");
-      assert.notInclude(warning, "db");
+      assert.deepEqual(started, {
+        failure: null,
+        warnings: [],
+        problems: ["web: port 3000 in use", notUp],
+      });
+      assert.isTrue(
+        logs.some((line) => line.includes("started the instance, but it is not ready")),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("starts a workspace deleted by hand only when told whose it was", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const storeRoot = yield* fileSystem.realPath(yield* fileSystem.makeTempDirectoryScoped());
+      const log = path.join(storeRoot, "calls.log");
+      yield* fakeNewgit(
+        `echo "$(pwd -P) $*" >> '${log}'; echo '{"instance":"feature","resources":[],"rebuilt":{"checkpoint":null}}'`,
+      );
+      const gone = path.join(storeRoot, "workspaces", "feature");
+      assert.deepEqual(yield* startNewgitInstance(gone), {
+        failure: null,
+        warnings: [],
+        problems: [],
+      });
+      assert.isFalse(yield* fileSystem.exists(log));
+      yield* startNewgitInstance(gone, { missing: { name: "feature", storeRoot } });
+      assert.deepEqual((yield* fileSystem.readFileString(log)).trim().split("\n"), [
+        `${storeRoot} start feature --json`,
+      ]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
@@ -161,7 +192,12 @@ describe("newgit workspaces", () => {
         resources: [
           { name: "db", status: "failed", blocked_by: [], prepare_log: "/tmp/db.log" },
           { name: "web", status: "blocked", blocked_by: ["db"], prepare_log: null },
+          // Prepared, so `ready` here; only `problems` says its check never passed.
+          { name: "api", status: "ready", blocked_by: [], prepare_log: null },
         ],
+        starting: [],
+        problems: ["`api` is not up after 3s (`curl` exited 7); its log is /tmp/api.log"],
+        logs: "/tmp/logs",
       });
       yield* fakeNewgit(`echo '${report}'; echo 'db: prepare failed' >&2; exit 1`);
       const logs: string[] = [];
@@ -178,6 +214,7 @@ describe("newgit workspaces", () => {
       const warning = logs.find((line) => line.includes("not ready")) ?? "";
       assert.include(warning, "db (failed): see /tmp/db.log");
       assert.include(warning, "web (blocked): blocked by db");
+      assert.include(warning, "`api` is not up after 3s");
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 

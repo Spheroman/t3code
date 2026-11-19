@@ -35,11 +35,26 @@ checkpoint, at the same path; if it can't, the turn fails before the agent
 starts with newgit's reason, including where it kept what was at the path,
 rather than running it in an empty folder. Each failed restore keeps another
 full copy, so after one fails the server runs no `start` for that workspace
-until the user sends a message; unsettling and retries wait. What a later
-`start` warns, such as that a saved copy is still there, is shown once in the
-thread, not on every turn.
+until the user sends a message; unsettling and retries wait. A workspace
+deleted by hand comes back the same way on the thread's next turn: `start`
+rebuilds it from the instance's latest checkpoint. A spawn or `start` that
+leaves the instance not ready (a `[ready]` check still failing after its
+timeout, a port another process holds, a definition problem) exits 1 with
+its report: that is not a failure, so the thread opens in the workspace and
+the turn runs. newgit's `problems`, and what a `start` warns, such as that a
+saved copy is still there, are shown once in the thread, not on every turn.
 Eviction is on by default: turn off **Free disk when a newgit
-thread settles** in Settings → Threads to keep settled workspaces on disk. Deleting the thread runs `newgit remove`. A new
+thread settles** in Settings → Threads to keep settled workspaces on disk.
+Deleting the thread and its workspace runs `newgit remove` before the
+thread is deleted. newgit refuses, deleting nothing, when that would lose
+what no checkpoint holds, most often a database kept in the workspace
+(`ownership = "workspace"`, the `postgres` template) whose dump cannot run
+because settling stopped it. The server then runs `newgit start` and removes
+again, if that start brought anything back; if newgit refuses again, it stops
+what it started and the user sees newgit's reason, choosing to delete
+anyway (`newgit remove --force`) or to keep the thread and its workspace as
+they were. A plain worktree is still removed after its thread, as upstream
+does. A new
 thread that starts from origin waits up to five minutes for its base
 branch to fetch, instead of 30 seconds, since a newgit remote can be slow. Every other project gets plain worktrees, as upstream does.
 
@@ -89,12 +104,15 @@ upstream T3 Code, so both run at once:
   a worktree's branch after the first message, and a newgit instance cannot
   be renamed.
 - Storage cleanup skips newgit workspaces; `newgit cleanup` owns them.
-- A missing newgit workspace is not recreated on resume, and MCP
-  `existing_worktree` launches reject newgit workspaces, since they are
+- MCP `existing_worktree` launches reject newgit workspaces, since they are
   separate clones rather than linked worktrees.
 - `stop` and `start` need a newgit with those commands (Spheroman/newgit#157),
   and eviction needs one with `stop --evict` (Spheroman/newgit#427). With an older one they fail,
-  the server logs a warning, and settling and turns go on as before.
+  the server logs a warning, and settling and turns go on as before. An
+  older `remove` never refuses, so it deletes a stopped database's data
+  directory without asking; an older `spawn` or `start` exits 0 when not
+  ready, and reports no `problems` to show; and an older `start` does not
+  rebuild a deleted workspace, so that turn fails with newgit's reason.
 - PR review guides still use their own temporary Git worktrees.
 - Sign-in flows that return through a `t3code://` link reach upstream
   T3 Code, not this app.
@@ -102,10 +120,25 @@ upstream T3 Code, so both run at once:
   state directory, and CLI name, so they fail here. They are left as they
   are to keep upstream merges clean.
 
+## Testing
+
+The newgit tests sit beside the code (`apps/server/src/vcs/newgit*.test.ts`,
+and the `newgit` cases in `ProviderTurnStartService.test.ts`). Most point
+`T3CODE_NEWGIT_BIN` at a shell script standing in for newgit, which logs its
+arguments and prints the report or refusal under test. The ones that need
+the real thing are skipped unless `newgit` runs, and the test runner does
+not pass `T3CODE_NEWGIT_BIN` through, so put the newgit you are testing
+first on `PATH`:
+
+```sh
+cd apps/server && PATH=/path/to/newgit/target/debug:$PATH vp test run src/vcs/newgit
+```
+
 ## Keeping up with upstream
 
 The newgit logic lives in `apps/server/src/vcs/newgitWorkspaces.ts`,
-`apps/server/src/orchestration-v2/NewgitLifecycleReactor.ts`, and
+`apps/server/src/orchestration-v2/NewgitLifecycleReactor.ts`,
+`apps/web/src/lib/newgitWorkspaceRemoval.ts`, and
 `apps/desktop/src/forkIdentity.ts`. Every edit to an upstream file is marked
 `newgit fork patch`, so `git grep "newgit fork patch"` lists every hook.
 

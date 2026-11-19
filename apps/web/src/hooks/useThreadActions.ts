@@ -35,6 +35,8 @@ import { vcsEnvironment } from "../state/vcs";
 import { useNewThreadHandler } from "./useHandleNewThread";
 import { refreshArchivedThreadsForEnvironment } from "../lib/archivedThreadsState";
 import { releaseComposerDraftUploads } from "../lib/composerDraftUploads";
+import { removeNewgitWorkspaceFirst } from "../lib/newgitWorkspaceRemoval";
+import { newgitTrackerList } from "../state/newgitTrackers";
 import { readLocalApi } from "../localApi";
 import {
   readEnvironmentServerConfigLoaded,
@@ -329,6 +331,8 @@ export function useThreadActions() {
     reportFailure: false,
     refresh: true,
   });
+  // newgit fork patch: whether a thread's project is a newgit project, so its workspace goes first.
+  const loadNewgitTrackers = useAtomQueryRunner(newgitTrackerList, { reportFailure: false });
   const refreshVcsStatus = useAtomCommand(vcsEnvironment.refreshStatus, {
     reportFailure: false,
   });
@@ -575,6 +579,66 @@ export function useThreadActions() {
       });
     }
 
+    // newgit fork patch: a newgit workspace goes before its thread, so a removal newgit refuses
+    // to keep what no checkpoint holds keeps the thread too, unless the user deletes anyway.
+    let newgitRemoval: Awaited<ReturnType<typeof removeWorktree>> | null = null;
+    if (
+      shouldDeleteWorktree &&
+      orphanedWorktreePath &&
+      threadProject &&
+      localApi &&
+      readEnvironmentScope(threadRef.environmentId, AuthSourceControlWriteScope)
+    ) {
+      const newgit = await loadNewgitTrackers({
+        environmentId: threadRef.environmentId,
+        input: { cwd: threadProject.workspaceRoot },
+      });
+      if (newgit._tag === "Success" && newgit.value.trackers !== null) {
+        const worktreeLabel = displayWorktreePath ?? orphanedWorktreePath;
+        const outcome = await removeNewgitWorkspaceFirst({
+          remove: async (newgitForce) => {
+            const removing = toastManager.add({
+              type: "loading",
+              title: "Deleting newgit workspace…",
+              description: worktreeLabel,
+              timeout: 0,
+            });
+            try {
+              return await removeWorktree({
+                environmentId: threadRef.environmentId,
+                input: {
+                  cwd: threadProject.workspaceRoot,
+                  path: orphanedWorktreePath,
+                  force: true,
+                  ...(newgitForce ? { newgitForce } : {}),
+                },
+              });
+            } finally {
+              toastManager.close(removing);
+            }
+          },
+          confirmDeleteAnyway: async (refusal) => {
+            const confirmed = await settlePromise(() =>
+              localApi.dialogs.confirm(
+                [
+                  "newgit did not delete this thread's workspace:",
+                  worktreeLabel,
+                  "",
+                  refusal,
+                  "",
+                  "Delete the thread and its workspace anyway? What no checkpoint holds is lost. Cancel keeps both.",
+                ].join("\n"),
+                { variant: "destructive" },
+              ),
+            );
+            return confirmed._tag === "Success" && confirmed.value;
+          },
+        });
+        if (outcome.kind === "kept") return AsyncResult.failure(Cause.interrupt());
+        newgitRemoval = outcome.result;
+      }
+    }
+
     const deletedThreadIds = deletedIds ?? new Set<ThreadId>();
     const currentRouteThreadRef = getCurrentRouteThreadRef();
     const shouldNavigateToFallback =
@@ -635,23 +699,26 @@ export function useThreadActions() {
       return deleteResult;
     }
 
-    const removeResult = readEnvironmentScope(threadRef.environmentId, AuthSourceControlWriteScope)
-      ? await removeWorktree({
-          environmentId: threadRef.environmentId,
-          input: {
-            cwd: threadProject.workspaceRoot,
-            path: orphanedWorktreePath,
-            force: true,
-          },
-        })
-      : AsyncResult.failure(
-          Cause.fail(
-            new EnvironmentAuthorizationError({
-              message: "This connection can no longer remove worktrees.",
-              requiredScope: AuthSourceControlWriteScope,
-            }),
-          ),
-        );
+    // newgit fork patch: a newgit workspace was removed before its thread.
+    const removeResult = newgitRemoval
+      ? newgitRemoval
+      : readEnvironmentScope(threadRef.environmentId, AuthSourceControlWriteScope)
+        ? await removeWorktree({
+            environmentId: threadRef.environmentId,
+            input: {
+              cwd: threadProject.workspaceRoot,
+              path: orphanedWorktreePath,
+              force: true,
+            },
+          })
+        : AsyncResult.failure(
+            Cause.fail(
+              new EnvironmentAuthorizationError({
+                message: "This connection can no longer remove worktrees.",
+                requiredScope: AuthSourceControlWriteScope,
+              }),
+            ),
+          );
     const refreshResult =
       removeResult._tag === "Success"
         ? await refreshVcsStatus({
