@@ -226,9 +226,9 @@ describe("releaseIdleProviderSessions", () => {
           ),
         hasUnfinishedWork: (providerSessionId) =>
           Effect.succeed(input.unfinished?.includes(providerSessionId) ?? false),
-        releaseUnlessBusy: ({ providerSessionId, ownProviderThreadIds, keepIfUnfinishedWork }) => {
+        releaseUnlessBusy: ({ providerSessionId, ownProviderThreadIds, keepIf }) => {
           assert.deepEqual(ownProviderThreadIds, []);
-          assert.isTrue(keepIfUnfinishedWork);
+          assert.isDefined(keepIf);
           released.push(providerSessionId);
           return Effect.succeed(true);
         },

@@ -38,7 +38,7 @@ export const useNewgitTrackerChoiceStore = create<NewgitTrackerChoiceState>()((s
 }));
 
 /** The `--use`/`--drop` a send passes for this draft's new worktree, if any. */
-export function newgitTrackerChoiceForThread(threadId: string): NewgitTrackerChoice | undefined {
+function newgitTrackerChoiceForThread(threadId: string): NewgitTrackerChoice | undefined {
   return useNewgitTrackerChoiceStore.getState().byThreadId[threadId]?.choice;
 }
 
